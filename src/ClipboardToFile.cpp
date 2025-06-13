@@ -1,7 +1,7 @@
 // ClipboardToFile.cpp
 //
 // A lightweight, dependency-free C++ utility to create files from clipboard text.
-// - Runs in the system tray.
+// - Stores user configuration in %APPDATA% for proper permissions.
 // - Uses a Win32 hook (Clipboard Viewer) for efficiency.
 // - Uses a dedicated worker thread with ReadDirectoryChangesW to monitor extensions.txt.
 // - Uses COM to find the active File Explorer path.
@@ -15,7 +15,7 @@
 #pragma comment(lib, "shlwapi.lib")
 
 #include <windows.h>
-#include <shlobj.h>
+#include <shlobj.h> // For SHGetFolderPathW
 #include <shlwapi.h>
 #include <string>
 #include <vector>
@@ -51,6 +51,7 @@ void CreateTrayIcon(HWND hwnd);
 void RemoveTrayIcon(HWND hwnd);
 void ShowContextMenu(HWND hwnd);
 void ShowToastNotification(HWND hwnd, const std::wstring& title, const std::wstring& msg, DWORD iconType);
+std::wstring GetSettingsFilePath();
 std::wstring GetSingleExplorerPath();
 void ProcessClipboardChange();
 DWORD WINAPI FileWatcherThread(LPVOID lpParam);
@@ -60,7 +61,6 @@ bool IsStartupEnabled();
 void SetStartup(bool enable);
 
 
-// --- Application Entry Point ---
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
     _In_ LPWSTR    lpCmdLine,
@@ -92,7 +92,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 }
 
 
-// --- Window Procedure: The Heart of the Application ---
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -149,10 +148,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         case ID_MENU_EDIT_EXTENSIONS:
         {
-            wchar_t exePath[MAX_PATH];
-            GetModuleFileNameW(NULL, exePath, MAX_PATH);
-            PathRemoveFileSpecW(exePath);
-            std::wstring settingsPath = std::wstring(exePath) + L"\\extensions.txt";
+            std::wstring settingsPath = GetSettingsFilePath();
             ShellExecuteW(NULL, L"open", settingsPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
         }
         break;
@@ -172,58 +168,90 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // --- File Watcher Worker Thread ---
 DWORD WINAPI FileWatcherThread(LPVOID lpParam)
 {
-    wchar_t dirPath[MAX_PATH];
-    GetModuleFileNameW(NULL, dirPath, MAX_PATH);
-    PathRemoveFileSpecW(dirPath);
+    wchar_t appDataPath[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) {
+        return 1; // Cannot get AppData, thread cannot run.
+    }
+    std::wstring dirPath = std::wstring(appDataPath) + L"\\ClipboardToFile";
+    CreateDirectoryW(dirPath.c_str(), NULL); // Ensure the directory exists.
 
-    HANDLE hDir = CreateFileW(dirPath, FILE_LIST_DIRECTORY,
+    HANDLE hDir = CreateFileW(dirPath.c_str(), FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
 
     if (hDir == INVALID_HANDLE_VALUE) return 1;
 
     BYTE buffer[1024];
     DWORD bytesReturned;
+    OVERLAPPED overlapped = { 0 };
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    while (WaitForSingleObject(g_hShutdownEvent, 0) == WAIT_TIMEOUT)
+    HANDLE waitHandles[2] = { g_hShutdownEvent, overlapped.hEvent };
+
+    while (true)
     {
         if (ReadDirectoryChangesW(hDir, buffer, sizeof(buffer), FALSE,
             FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
-            &bytesReturned, NULL, NULL))
+            &bytesReturned, &overlapped, NULL))
         {
-            if (bytesReturned > 0)
-            {
-                FILE_NOTIFY_INFORMATION* pNotify = (FILE_NOTIFY_INFORMATION*)buffer;
-                while (pNotify)
-                {
-                    std::wstring filename(pNotify->FileName, pNotify->FileNameLength / sizeof(wchar_t));
-                    if (_wcsicmp(filename.c_str(), L"extensions.txt") == 0)
-                    {
-                        PostMessage(g_hMainWnd, WM_APP_RELOAD_EXTENSIONS, 0, 0);
-                        break;
-                    }
-                    pNotify = pNotify->NextEntryOffset > 0 ?
-                        (FILE_NOTIFY_INFORMATION*)((BYTE*)pNotify + pNotify->NextEntryOffset) : NULL;
-                }
+            DWORD waitStatus = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+
+            if (waitStatus == WAIT_OBJECT_0) { // Shutdown event
+                break;
             }
+
+            if (waitStatus == WAIT_OBJECT_0 + 1) // File change event
+            {
+                if (GetOverlappedResult(hDir, &overlapped, &bytesReturned, FALSE) && bytesReturned > 0)
+                {
+                    FILE_NOTIFY_INFORMATION* pNotify = (FILE_NOTIFY_INFORMATION*)buffer;
+                    while (pNotify)
+                    {
+                        std::wstring filename(pNotify->FileName, pNotify->FileNameLength / sizeof(wchar_t));
+                        if (_wcsicmp(filename.c_str(), L"extensions.txt") == 0)
+                        {
+                            PostMessage(g_hMainWnd, WM_APP_RELOAD_EXTENSIONS, 0, 0);
+                            break;
+                        }
+                        pNotify = pNotify->NextEntryOffset > 0 ?
+                            (FILE_NOTIFY_INFORMATION*)((BYTE*)pNotify + pNotify->NextEntryOffset) : NULL;
+                    }
+                }
+                ResetEvent(overlapped.hEvent);
+            }
+        }
+        else {
+            break; // ReadDirectoryChangesW failed, exit thread
         }
     }
 
     CloseHandle(hDir);
+    CloseHandle(overlapped.hEvent);
     return 0;
 }
 
 
 // --- Core Logic & File Management ---
 
+std::wstring GetSettingsFilePath()
+{
+    wchar_t appDataPath[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath)))
+    {
+        std::wstring fullPath = std::wstring(appDataPath) + L"\\ClipboardToFile";
+        CreateDirectoryW(fullPath.c_str(), NULL);
+        return fullPath + L"\\extensions.txt";
+    }
+    return L"extensions.txt"; // Fallback
+}
+
 void InitializeAndLoadExtensions()
 {
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecW(exePath);
-    std::wstring settingsPath = std::wstring(exePath) + L"\\extensions.txt";
+    std::wstring settingsPath = GetSettingsFilePath();
 
-    if (GetFileAttributesW(settingsPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    // Check if the file exists by trying to open it. If it doesn't, create it.
+    std::wifstream checkFile(settingsPath);
+    if (!checkFile.is_open())
     {
         const std::vector<std::wstring> defaultExtensions = {
             L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml"
@@ -236,16 +264,16 @@ void InitializeAndLoadExtensions()
             newSettingsFile.close();
         }
     }
+    else {
+        checkFile.close();
+    }
+
     ReloadExtensions(true);
 }
 
 bool ReloadExtensions(bool isInitialLoad)
 {
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecW(exePath);
-    std::wstring settingsPath = std::wstring(exePath) + L"\\extensions.txt";
-
+    std::wstring settingsPath = GetSettingsFilePath();
     std::vector<std::wstring> tempExtensions;
     bool hadBadLines = false;
 
@@ -352,12 +380,9 @@ std::wstring GetSingleExplorerPath()
     IShellWindows* pShellWindows = NULL;
 
     HRESULT hr = CoInitialize(NULL);
-    if (FAILED(hr)) {
-        return L"";
-    }
+    if (FAILED(hr)) return L"";
 
-    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows); 
-    
+    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
     if (SUCCEEDED(hr))
     {
         long count;
