@@ -351,8 +351,13 @@ std::wstring GetSingleExplorerPath()
     std::vector<std::wstring> paths;
     IShellWindows* pShellWindows = NULL;
 
-    CoInitialize(NULL);
-    HRESULT hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
+    HRESULT hr = CoInitialize(NULL);
+    if (FAILED(hr)) {
+        return L"";
+    }
+
+    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows); 
+    
     if (SUCCEEDED(hr))
     {
         long count;
