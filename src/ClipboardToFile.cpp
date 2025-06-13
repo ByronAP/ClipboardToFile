@@ -19,6 +19,9 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>      // For wstringstream
+#include <iomanip>      // For std::setw
+#include <regex>        // For std::wregex
+#include "nlohmann/json.hpp"     // For nlohmann/json library via submodule
 #include "resource.h"
 
 
@@ -39,22 +42,30 @@
 //                              GLOBAL STATE & CONSTANTS                                          //
 //------------------------------------------------------------------------------------------------//
 #define WM_TRAY_ICON_MSG            (WM_USER + 1)   // Message for tray icon events
-#define WM_APP_RELOAD_EXTENSIONS    (WM_USER + 2)   // Message from watcher thread to trigger reload
+#define WM_APP_RELOAD_CONFIG        (WM_USER + 2)   // Message from watcher thread to trigger reload
 #define WM_APP_UPDATE_FOUND         (WM_USER + 3)   // Message for application updates
 #define ID_TRAY_ICON                1
-#define ID_MENU_TOGGLE              1001
-#define ID_MENU_EDIT_EXTENSIONS     1002
-#define ID_MENU_START_WITH_WINDOWS  1003
-#define ID_MENU_EXIT                1004
+#define ID_MENU_TOGGLE_EMPTY        1001
+#define ID_MENU_TOGGLE_CONTENT      1002
+#define ID_MENU_EDIT_CONFIG         1003
+#define ID_MENU_START_WITH_WINDOWS  1004
+#define ID_MENU_EXIT                1005
 
 const wchar_t CLASS_NAME[] = L"ClipboardToFileWindowClass";
 HWND  g_hMainWnd = NULL;
 HWND  g_hNextClipboardViewer = NULL;
-bool  g_isEnabled = true;
-std::vector<std::wstring> g_allowedExtensions;
-std::mutex g_extensionsMutex;
 HANDLE g_hWatcherThread = NULL;
 HANDLE g_hShutdownEvent = NULL;
+std::mutex g_extensionsMutex;
+
+struct AppSettings {
+    bool isCreateEmptyFileEnabled = true;
+    bool isCreateWithContentEnabled = true;
+    std::vector<std::wstring> allowedExtensions;
+    std::vector<std::wstring> contentCreationRegexes;
+    int heuristicWordCountLimit = 5;
+};
+AppSettings g_settings;
 
 
 //------------------------------------------------------------------------------------------------//
@@ -65,15 +76,21 @@ void CreateTrayIcon(HWND);
 void RemoveTrayIcon(HWND);
 void ShowContextMenu(HWND);
 void ShowToastNotification(HWND, const std::wstring&, const std::wstring&, DWORD);
-std::wstring GetSettingsFilePath();
+std::wstring GetConfigFilePath();
 std::wstring GetSingleExplorerPath();
 void ProcessClipboardChange();
 DWORD WINAPI FileWatcherThread(LPVOID);
-void InitializeAndLoadExtensions();
-bool ReloadExtensions(bool);
+void LoadSettings();
+void SaveSettings();
 bool IsStartupEnabled();
 void SetStartup(bool);
 void CheckForUpdatesIfNeeded();
+bool TryFullFileGeneration(const std::wstring&);
+void TryEmptyFileCreation(const std::wstring&);
+int CountWords(const std::wstring&);
+struct AppVersion { int major = 0, minor = 0, patch = 0, build = 0; };
+AppVersion GetCurrentAppVersion();
+AppVersion ParseVersionString(const std::wstring&);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -112,7 +129,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     switch (msg) {
     case WM_CREATE:
         // This message is sent once when the window is first created.
-        InitializeAndLoadExtensions();
+        LoadSettings();
         g_hNextClipboardViewer = SetClipboardViewer(hwnd);
         CreateTrayIcon(hwnd);
         g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -142,10 +159,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // CRITICAL: We must pass this message on to the next window in the chain.
         SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
         break;
-    case WM_APP_RELOAD_EXTENSIONS:
+    case WM_APP_RELOAD_CONFIG:
         // Handles the reload request from our file watcher thread.
         Sleep(100); // Small delay to prevent race conditions with text editors.
-        ReloadExtensions(false);
+        LoadSettings();
+        ShowToastNotification(g_hMainWnd, L"Config Reloaded", L"Configuration has been updated from config.json.", NIIF_INFO);
         break;
     case WM_APP_UPDATE_FOUND: {
         wchar_t* releaseUrl = (wchar_t*)lParam;
@@ -163,14 +181,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case ID_MENU_TOGGLE:
-            g_isEnabled = !g_isEnabled;
+        case ID_MENU_TOGGLE_EMPTY: {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            g_settings.isCreateEmptyFileEnabled = !g_settings.isCreateEmptyFileEnabled;
+            SaveSettings();
             break;
+        }
+        case ID_MENU_TOGGLE_CONTENT: {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            g_settings.isCreateWithContentEnabled = !g_settings.isCreateWithContentEnabled;
+            SaveSettings();
+            break;
+        }
         case ID_MENU_START_WITH_WINDOWS:
             SetStartup(!IsStartupEnabled());
             break;
-        case ID_MENU_EDIT_EXTENSIONS: {
-            std::wstring settingsPath = GetSettingsFilePath();
+        case ID_MENU_EDIT_CONFIG: {
+            std::wstring settingsPath = GetConfigFilePath();
             // Use ShellExecute to open the file with its default registered application.
             ShellExecuteW(NULL, L"open", settingsPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
             break;
@@ -188,10 +215,107 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 
 //------------------------------------------------------------------------------------------------//
+//                            CONFIGURATION & SETTINGS MANAGEMENT                                 //
+//------------------------------------------------------------------------------------------------//
+// Helper function to convert a UTF-8 std::string (from JSON library) to a std::wstring (for Win32 API).
+std::wstring Utf8ToWstring(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+// Helper function to convert a std::wstring to a UTF-8 std::string for saving to JSON.
+std::string WstringToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+// Gets the full path to config.json in %APPDATA%\ClipboardToFile.
+std::wstring GetConfigFilePath() {
+    wchar_t appDataPath[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) {
+        std::wstring fullPath = std::wstring(appDataPath) + L"\\ClipboardToFile";
+        CreateDirectoryW(fullPath.c_str(), NULL);
+        return fullPath + L"\\config.json";
+    }
+    return L"config.json"; // Fallback to local directory.
+}
+
+// Writes the current state of the g_settings struct to config.json, persisting user choices.
+void SaveSettings() {
+    std::wstring settingsPath = GetConfigFilePath();
+    nlohmann::json j;
+    {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        j["createEmptyFileEnabled"] = g_settings.isCreateEmptyFileEnabled;
+        j["createWithContentEnabled"] = g_settings.isCreateWithContentEnabled;
+        std::vector<std::string> utf8_allowedExtensions;
+        for (const auto& wstr : g_settings.allowedExtensions) utf8_allowedExtensions.push_back(WstringToUtf8(wstr));
+        j["allowedExtensions"] = utf8_allowedExtensions;
+        std::vector<std::string> utf8_regexes;
+        for (const auto& wstr : g_settings.contentCreationRegexes) utf8_regexes.push_back(WstringToUtf8(wstr));
+        j["contentCreationRegexes"] = utf8_regexes;
+        j["heuristicWordCountLimit"] = g_settings.heuristicWordCountLimit;
+    }
+    std::ofstream o(settingsPath);
+    o << std::setw(2) << j << std::endl;
+}
+
+// Reads config.json, creates a default if missing, and populates the global g_settings struct.
+void LoadSettings() {
+    std::wstring settingsPath = GetConfigFilePath();
+    AppSettings defaults;
+    defaults.allowedExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml", L".cs", L".c" };
+    defaults.contentCreationRegexes = {
+        L"^// --- START OF FILE: (.*) ---$",
+        L"^file: (.*)$",
+        L"^(.*\\.[a-zA-Z0-9]+)$"
+    };
+
+    std::ifstream f(settingsPath);
+    if (!f.is_open()) {
+        {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            g_settings = defaults;
+        }
+        SaveSettings(); // Save the new default file.
+        return;
+    }
+
+    try {
+        nlohmann::json j = nlohmann::json::parse(f);
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        g_settings.isCreateEmptyFileEnabled = j.value("createEmptyFileEnabled", defaults.isCreateEmptyFileEnabled);
+        g_settings.isCreateWithContentEnabled = j.value("createWithContentEnabled", defaults.isCreateWithContentEnabled);
+        if (j.contains("allowedExtensions")) {
+            g_settings.allowedExtensions.clear();
+            for (const auto& str : j["allowedExtensions"]) g_settings.allowedExtensions.push_back(Utf8ToWstring(str.get<std::string>()));
+        }
+        else { g_settings.allowedExtensions = defaults.allowedExtensions; }
+        if (j.contains("contentCreationRegexes")) {
+            g_settings.contentCreationRegexes.clear();
+            for (const auto& str : j["contentCreationRegexes"]) g_settings.contentCreationRegexes.push_back(Utf8ToWstring(str.get<std::string>()));
+        }
+        else { g_settings.contentCreationRegexes = defaults.contentCreationRegexes; }
+        g_settings.heuristicWordCountLimit = j.value("heuristicWordCountLimit", defaults.heuristicWordCountLimit);
+    }
+    catch (const nlohmann::json::parse_error&) {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        g_settings = defaults;
+        ShowToastNotification(g_hMainWnd, L"Config Error", L"Could not parse config.json. Loading defaults.", NIIF_ERROR);
+    }
+}
+
+
+//------------------------------------------------------------------------------------------------//
 //                                     UPDATE CHECKER                                             //
 //------------------------------------------------------------------------------------------------//
-struct AppVersion { int major = 0, minor = 0, patch = 0, build = 0; };
-
+// Parses a version string like "v1.2.3.4" into a struct for easy comparison.
 AppVersion ParseVersionString(const std::wstring& versionStr) {
     AppVersion v;
     std::wstring s = (versionStr[0] == L'v') ? versionStr.substr(1) : versionStr;
@@ -201,6 +325,7 @@ AppVersion ParseVersionString(const std::wstring& versionStr) {
     return v;
 }
 
+// Reads the embedded VS_VERSION_INFO resource from the running executable to determine its own version.
 AppVersion GetCurrentAppVersion() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -307,13 +432,11 @@ void CheckForUpdatesIfNeeded() {
 // Monitors the settings directory using asynchronous I/O and notifies the main thread of changes.
 DWORD WINAPI FileWatcherThread(LPVOID)
 {
-    wchar_t appDataPath[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) return 1;
-
-    std::wstring dirPath = std::wstring(appDataPath) + L"\\ClipboardToFile";
-    CreateDirectoryW(dirPath.c_str(), NULL);
-
-    HANDLE hDir = CreateFileW(dirPath.c_str(), FILE_LIST_DIRECTORY,
+    std::wstring configPath = GetConfigFilePath();
+    wchar_t dirPath[MAX_PATH];
+    wcscpy_s(dirPath, configPath.c_str());
+    PathRemoveFileSpecW(dirPath);
+    HANDLE hDir = CreateFileW(dirPath, FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
     if (hDir == INVALID_HANDLE_VALUE) return 1;
@@ -344,9 +467,9 @@ DWORD WINAPI FileWatcherThread(LPVOID)
                 FILE_NOTIFY_INFORMATION* pNotify = (FILE_NOTIFY_INFORMATION*)buffer;
                 while (pNotify) {
                     std::wstring filename(pNotify->FileName, pNotify->FileNameLength / sizeof(wchar_t));
-                    if (_wcsicmp(filename.c_str(), L"extensions.txt") == 0) {
+                    if (_wcsicmp(filename.c_str(), L"config.json") == 0) {
                         // Post a message to the main UI thread to handle the reload safely.
-                        PostMessage(g_hMainWnd, WM_APP_RELOAD_EXTENSIONS, 0, 0);
+                        PostMessage(g_hMainWnd, WM_APP_RELOAD_CONFIG, 0, 0);
                         break;
                     }
                     pNotify = pNotify->NextEntryOffset > 0 ? (FILE_NOTIFY_INFORMATION*)((BYTE*)pNotify + pNotify->NextEntryOffset) : NULL;
@@ -358,7 +481,6 @@ DWORD WINAPI FileWatcherThread(LPVOID)
             break; // An error occurred.
         }
     }
-
     CancelIo(hDir);
     CloseHandle(hDir);
     CloseHandle(overlapped.hEvent);
@@ -369,97 +491,109 @@ DWORD WINAPI FileWatcherThread(LPVOID)
 //------------------------------------------------------------------------------------------------//
 //                          CORE LOGIC & FILE MANAGEMENT                                          //
 //------------------------------------------------------------------------------------------------//
-// Gets path to extensions.txt in %APPDATA%\ClipboardToFile, the correct location for user config.
-std::wstring GetSettingsFilePath()
-{
-    wchar_t appDataPath[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) {
-        std::wstring fullPath = std::wstring(appDataPath) + L"\\ClipboardToFile";
-        CreateDirectoryW(fullPath.c_str(), NULL);
-        return fullPath + L"\\extensions.txt";
-    }
-    return L"extensions.txt"; // Fallback to local directory.
+// A simple helper to count words in a string, used by the content-creation heuristic.
+int CountWords(const std::wstring& str) {
+    std::wstringstream ss(str);
+    std::wstring word;
+    int count = 0;
+    while (ss >> word) count++;
+    return count;
 }
 
-// Creates a default config file on first run if needed, then performs initial load.
-void InitializeAndLoadExtensions()
-{
-    std::wstring settingsPath = GetSettingsFilePath();
-    std::wifstream checkFile(settingsPath);
-    if (!checkFile.is_open()) {
-        const std::vector<std::wstring> defaultExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml", L".cs", L".c" };
-        std::wofstream newSettingsFile(settingsPath);
-        if (newSettingsFile.is_open()) {
-            for (const auto& ext : defaultExtensions) newSettingsFile << ext << std::endl;
-            newSettingsFile.close();
-        }
-    }
-    else {
-        checkFile.close();
-    }
-    ReloadExtensions(true);
-}
+// Heuristically checks for a filename. It first tries matching against user-defined regexes,
+// and if not found, falls back to a simpler "filename on first line" heuristic.
+// Returns true if it successfully creates a file, preventing other logic from running.
+bool TryFullFileGeneration(const std::wstring& clipboardText) {
+    size_t first_line_end = clipboardText.find(L'\n');
+    if (first_line_end == std::wstring::npos) return false;
 
-// Reads extensions.txt and loads them into the global vector. Returns true on success.
-bool ReloadExtensions(bool isInitialLoad)
-{
-    std::wstring settingsPath = GetSettingsFilePath();
-    std::vector<std::wstring> tempExtensions;
-    bool hadBadLines = false;
-    std::wifstream settingsFile(settingsPath);
-    if (!settingsFile.is_open()) {
-        if (!isInitialLoad) ShowToastNotification(g_hMainWnd, L"Reload Failed", L"Could not open extensions.txt.", NIIF_ERROR);
-        return false;
-    }
+    std::wstring firstLine = clipboardText.substr(0, first_line_end);
+    firstLine.erase(0, firstLine.find_first_not_of(L" \t\r\n"));
+    firstLine.erase(firstLine.find_last_not_of(L" \t\r\n") + 1);
 
-    std::wstring line;
-    while (std::getline(settingsFile, line)) {
-        // Sanitize each line from the file.
-        line.erase(0, line.find_first_not_of(L" \t\n\r"));
-        line.erase(line.find_last_not_of(L" \t\n\r") + 1);
-        if (line.empty() || line[0] == L'#' || (line[0] == L'/' && line[1] == L'/')) continue;
-        if (wcspbrk(line.c_str(), L"\\/:*?\"<>|")) { hadBadLines = true; continue; }
-        if (line[0] != L'.') line.insert(0, 1, L'.');
-        std::transform(line.begin(), line.end(), line.begin(), ::towlower);
-        tempExtensions.push_back(line);
-    }
-    settingsFile.close();
+    std::wstring filename;
+    bool format_detected = false;
 
-    // Atomically swap the new list for the old one for thread safety.
+    // Priority 1: Iterate through user-defined regex patterns from config.
+    std::vector<std::wstring> regexes;
     {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        g_allowedExtensions.swap(tempExtensions);
+        regexes = g_settings.contentCreationRegexes;
+    }
+    for (const auto& pattern : regexes) {
+        try {
+            std::wregex rx(pattern, std::regex::ECMAScript | std::regex::icase);
+            std::wsmatch match;
+            if (std::regex_match(firstLine, match, rx) && match.size() > 1) {
+                filename = match[1].str();
+                format_detected = true;
+                break;
+            }
+        }
+        catch (const std::regex_error&) { continue; } // Silently ignore invalid regex patterns.
     }
 
-    if (!isInitialLoad) {
-        if (hadBadLines) ShowToastNotification(g_hMainWnd, L"Extensions Reloaded", L"Settings updated. Some invalid lines were skipped.", NIIF_WARNING);
-        else ShowToastNotification(g_hMainWnd, L"Extensions Reloaded", L"Settings have been updated from extensions.txt.", NIIF_INFO);
+    // Priority 2: Fallback to the simpler word-count heuristic.
+    if (!format_detected) {
+        wchar_t ext[_MAX_EXT];
+        _wsplitpath_s(firstLine.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
+        std::wstring extension(ext);
+        std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+
+        bool isAllowedExtension = false;
+        int wordCountLimit = 5;
+        {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            for (const auto& allowedExt : g_settings.allowedExtensions) {
+                if (extension == allowedExt) { isAllowedExtension = true; break; }
+            }
+            wordCountLimit = g_settings.heuristicWordCountLimit;
+        }
+
+        if (isAllowedExtension && CountWords(firstLine) <= wordCountLimit) {
+            filename = firstLine;
+            format_detected = true;
+        }
     }
-    return true;
+
+    // If a filename was found by any method, proceed with file creation.
+    if (format_detected) {
+        filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
+        filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
+        if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) {
+            return true; // Detected a pattern but filename is invalid. Stop all further processing.
+        }
+        std::wstring content = clipboardText.substr(first_line_end + 1);
+        std::wstring explorerPath = GetSingleExplorerPath();
+        if (!explorerPath.empty()) {
+            std::wstring fullPath = explorerPath + L"\\" + filename;
+            if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                std::wofstream outFile(fullPath);
+                if (outFile.is_open()) {
+                    outFile << content;
+                    outFile.close();
+                    std::wstring successMessage = L"Generated file with content: " + filename;
+                    ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
-// Called on every clipboard change to check for a valid filename and create the file.
-void ProcessClipboardChange()
-{
-    if (!g_isEnabled || !IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(g_hMainWnd)) return;
+// Handles creating an empty file if the entire clipboard text is a valid filename.
+void TryEmptyFileCreation(const std::wstring& clipboardText) {
+    std::wstring filename = clipboardText;
+    filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
+    filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
+    if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) return;
 
-    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
-    if (hData == NULL) { CloseClipboard(); return; }
-
-    wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
-    if (pszText == NULL) { CloseClipboard(); return; }
-
-    std::wstring clipboardText(pszText);
-    GlobalUnlock(hData);
-    CloseClipboard();
-
-    // Sanitize and validate the clipboard text.
-    clipboardText.erase(0, clipboardText.find_first_not_of(L" \t\n\r"));
-    clipboardText.erase(clipboardText.find_last_not_of(L" \t\n\r") + 1);
-    if (clipboardText.empty() || wcspbrk(clipboardText.c_str(), L"\\/:*?\"<>|") != nullptr) return;
+    // To avoid ambiguity, don't treat multi-line text as an empty filename.
+    if (filename.find(L'\n') != std::wstring::npos) return;
 
     wchar_t ext[_MAX_EXT];
-    _wsplitpath_s(clipboardText.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
+    _wsplitpath_s(filename.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
     std::wstring extension(ext);
     std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
 
@@ -467,7 +601,7 @@ void ProcessClipboardChange()
     bool isAllowed = false;
     {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        for (const auto& allowedExt : g_allowedExtensions) {
+        for (const auto& allowedExt : g_settings.allowedExtensions) {
             if (extension == allowedExt) { isAllowed = true; break; }
         }
     }
@@ -477,18 +611,50 @@ void ProcessClipboardChange()
     // Safety check: only proceed if exactly one File Explorer window is open.
     std::wstring explorerPath = GetSingleExplorerPath();
     if (!explorerPath.empty()) {
-        std::wstring fullPath = explorerPath + L"\\" + clipboardText;
+        std::wstring fullPath = explorerPath + L"\\" + filename;
         if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
             try {
                 HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
                 if (hFile != INVALID_HANDLE_VALUE) {
                     CloseHandle(hFile);
-                    std::wstring successMessage = L"Created file: " + clipboardText;
+                    std::wstring successMessage = L"Created empty file: " + filename;
                     ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
                 }
             }
             catch (...) {}
         }
+    }
+}
+
+// Main dispatcher called on every clipboard change.
+void ProcessClipboardChange()
+{
+    bool emptyEnabled, contentEnabled;
+    {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        emptyEnabled = g_settings.isCreateEmptyFileEnabled;
+        contentEnabled = g_settings.isCreateWithContentEnabled;
+    }
+    if (!emptyEnabled && !contentEnabled) return;
+
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(g_hMainWnd)) return;
+    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+    if (hData == NULL) { CloseClipboard(); return; }
+    wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
+    if (pszText == NULL) { CloseClipboard(); return; }
+    std::wstring clipboardText(pszText);
+    GlobalUnlock(hData);
+    CloseClipboard();
+
+    // Give "Create with Content" priority if it's enabled.
+    if (contentEnabled) {
+        if (TryFullFileGeneration(clipboardText)) {
+            return; // If it succeeded or handled the event, we are done.
+        }
+    }
+    // Otherwise, try the "Create Empty File" logic if it's enabled.
+    if (emptyEnabled) {
+        TryEmptyFileCreation(clipboardText);
     }
 }
 
@@ -543,7 +709,6 @@ std::wstring GetSingleExplorerPath()
 //------------------------------------------------------------------------------------------------//
 //                                  TRAY ICON & UI MANAGEMENT                                     //
 //------------------------------------------------------------------------------------------------//
-
 void CreateTrayIcon(HWND hwnd)
 {
     NOTIFYICONDATAW nid = {};
@@ -573,14 +738,17 @@ void ShowContextMenu(HWND hwnd)
     POINT pt; GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
     if (hMenu) {
-        UINT enabledFlags = g_isEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
-        InsertMenu(hMenu, 0, MF_BYPOSITION | enabledFlags, ID_MENU_TOGGLE, L"Enabled");
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        UINT emptyFlags = g_settings.isCreateEmptyFileEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
+        InsertMenu(hMenu, 0, MF_BYPOSITION | emptyFlags, ID_MENU_TOGGLE_EMPTY, L"Create Empty File");
+        UINT contentFlags = g_settings.isCreateWithContentEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
+        InsertMenu(hMenu, 1, MF_BYPOSITION | contentFlags, ID_MENU_TOGGLE_CONTENT, L"Create File with Content");
+        InsertMenu(hMenu, 2, MF_SEPARATOR, 0, NULL);
         UINT startupFlags = IsStartupEnabled() ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
-        InsertMenu(hMenu, 1, MF_BYPOSITION | startupFlags, ID_MENU_START_WITH_WINDOWS, L"Start with Windows");
-        InsertMenu(hMenu, 2, MF_BYPOSITION | MF_STRING, ID_MENU_EDIT_EXTENSIONS, L"Edit Extensions...");
-        InsertMenu(hMenu, 3, MF_SEPARATOR, 0, NULL);
-        InsertMenu(hMenu, 4, MF_BYPOSITION | MF_STRING, ID_MENU_EXIT, L"Exit");
-
+        InsertMenu(hMenu, 3, MF_BYPOSITION | startupFlags, ID_MENU_START_WITH_WINDOWS, L"Start with Windows");
+        InsertMenu(hMenu, 4, MF_BYPOSITION | MF_STRING, ID_MENU_EDIT_CONFIG, L"Edit Config...");
+        InsertMenu(hMenu, 5, MF_SEPARATOR, 0, NULL);
+        InsertMenu(hMenu, 6, MF_BYPOSITION | MF_STRING, ID_MENU_EXIT, L"Exit");
         SetForegroundWindow(hwnd);
         TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
         DestroyMenu(hMenu);
