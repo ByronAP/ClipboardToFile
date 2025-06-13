@@ -31,7 +31,7 @@ jobs:
           -p:CodeAnalysisTreatWarningsAsErrors=true
 
       - name: Setup Inno Setup
-        uses: Minionguyjpro/Inno-Setup-Action@v1.1
+        uses: ImagineBoom/Inno-Setup-Action@v1.0.0
 
       - name: Build Installer
         run: iscc "installer.iss" /DAppVersion=${{ env.VERSION_MM }}.${{ github.run_number }}
