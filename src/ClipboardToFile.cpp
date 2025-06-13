@@ -12,11 +12,13 @@
 #include <windows.h>
 #include <shlobj.h>     // For SHGetFolderPathW
 #include <shlwapi.h>    // For Path... functions
+#include <wininet.h>    // For HTTP requests to check for updates
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <fstream>
 #include <mutex>
+#include <sstream>      // For wstringstream
 #include "resource.h"
 
 
@@ -29,6 +31,8 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "version.lib")
 
 
 //------------------------------------------------------------------------------------------------//
@@ -36,6 +40,7 @@
 //------------------------------------------------------------------------------------------------//
 #define WM_TRAY_ICON_MSG            (WM_USER + 1)   // Message for tray icon events
 #define WM_APP_RELOAD_EXTENSIONS    (WM_USER + 2)   // Message from watcher thread to trigger reload
+#define WM_APP_UPDATE_FOUND         (WM_USER + 3)   // Message for application updates
 #define ID_TRAY_ICON                1
 #define ID_MENU_TOGGLE              1001
 #define ID_MENU_EDIT_EXTENSIONS     1002
@@ -68,6 +73,7 @@ void InitializeAndLoadExtensions();
 bool ReloadExtensions(bool);
 bool IsStartupEnabled();
 void SetStartup(bool);
+void CheckForUpdatesIfNeeded();
 
 
 //------------------------------------------------------------------------------------------------//
@@ -111,6 +117,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         CreateTrayIcon(hwnd);
         g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         g_hWatcherThread = CreateThread(NULL, 0, FileWatcherThread, NULL, 0, NULL);
+        CheckForUpdatesIfNeeded();
         break;
     case WM_DESTROY:
         // Performs cleanup in reverse order of creation to ensure safe shutdown.
@@ -140,6 +147,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         Sleep(100); // Small delay to prevent race conditions with text editors.
         ReloadExtensions(false);
         break;
+    case WM_APP_UPDATE_FOUND: {
+        wchar_t* releaseUrl = (wchar_t*)lParam;
+        if (releaseUrl) {
+            std::wstring message = L"A new version is available!\n\nWould you like to open the download page?";
+            if (MessageBoxW(hwnd, message.c_str(), L"Update Available", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+                ShellExecuteW(NULL, L"open", releaseUrl, NULL, NULL, SW_SHOWNORMAL);
+            }
+            delete[] releaseUrl; // Free the memory allocated by the worker thread.
+        }
+        break;
+    }
     case WM_TRAY_ICON_MSG:
         if (lParam == WM_RBUTTONUP) ShowContextMenu(hwnd);
         break;
@@ -170,10 +188,120 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 
 //------------------------------------------------------------------------------------------------//
+//                                     UPDATE CHECKER                                             //
+//------------------------------------------------------------------------------------------------//
+struct AppVersion { int major = 0, minor = 0, patch = 0, build = 0; };
+
+AppVersion ParseVersionString(const std::wstring& versionStr) {
+    AppVersion v;
+    std::wstring s = (versionStr[0] == L'v') ? versionStr.substr(1) : versionStr;
+    std::wstringstream ss(s);
+    wchar_t dot;
+    ss >> v.major >> dot >> v.minor >> dot >> v.patch >> dot >> v.build;
+    return v;
+}
+
+AppVersion GetCurrentAppVersion() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    DWORD handle = 0;
+    DWORD versionSize = GetFileVersionInfoSizeW(exePath, &handle);
+    if (versionSize == 0) return {};
+    std::vector<BYTE> versionData(versionSize);
+    if (!GetFileVersionInfoW(exePath, handle, versionSize, versionData.data())) return {};
+    VS_FIXEDFILEINFO* pFileInfo = nullptr;
+    UINT fileInfoSize = 0;
+    if (VerQueryValueW(versionData.data(), L"\\", (LPVOID*)&pFileInfo, &fileInfoSize) && pFileInfo) {
+        AppVersion v;
+        v.major = HIWORD(pFileInfo->dwFileVersionMS);
+        v.minor = LOWORD(pFileInfo->dwFileVersionMS);
+        v.patch = HIWORD(pFileInfo->dwFileVersionLS);
+        v.build = LOWORD(pFileInfo->dwFileVersionLS);
+        return v;
+    }
+    return {};
+}
+
+const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
+
+// Background thread function that performs the network request to the GitHub API.
+DWORD WINAPI PerformUpdateCheck(LPVOID) {
+    HINTERNET hInternet = InternetOpenW(L"ClipboardToFile/1.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (hInternet) {
+        HINTERNET hConnect = InternetOpenUrlW(hInternet,
+            L"https://api.github.com/repos/ByronAP/ClipboardToFile/releases/latest",
+            L"User-Agent: ClipboardToFile-Update-Check\r\n", -1L,
+            INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+        if (hConnect) {
+            std::string response;
+            char buffer[4096];
+            DWORD bytesRead;
+            while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+                response.append(buffer, bytesRead);
+            }
+            InternetCloseHandle(hConnect);
+            size_t tagPos = response.find("\"tag_name\":");
+            size_t urlPos = response.find("\"html_url\":");
+            if (tagPos != std::string::npos && urlPos != std::string::npos) {
+                size_t tagStart = response.find("\"", tagPos + 11) + 1;
+                size_t tagEnd = response.find("\"", tagStart);
+                std::string latestVersionStr = response.substr(tagStart, tagEnd - tagStart);
+                size_t urlStart = response.find("\"", urlPos + 11) + 1;
+                size_t urlEnd = response.find("\"", urlStart);
+                std::string releaseUrlStr = response.substr(urlStart, urlEnd - urlStart);
+                std::wstring latestVersionW(latestVersionStr.begin(), latestVersionStr.end());
+                std::wstring releaseUrlW(releaseUrlStr.begin(), releaseUrlStr.end());
+                AppVersion currentV = GetCurrentAppVersion();
+                AppVersion latestV = ParseVersionString(latestVersionW);
+                if (latestV.major > currentV.major ||
+                    (latestV.major == currentV.major && latestV.minor > currentV.minor) ||
+                    (latestV.major == currentV.major && latestV.minor == currentV.minor && latestV.patch > currentV.patch) ||
+                    (latestV.major == currentV.major && latestV.minor == currentV.minor && latestV.patch == currentV.patch && latestV.build > currentV.build)) {
+                    wchar_t* url_heap = new wchar_t[releaseUrlW.length() + 1];
+                    wcscpy_s(url_heap, releaseUrlW.length() + 1, releaseUrlW.c_str());
+                    PostMessage(g_hMainWnd, WM_APP_UPDATE_FOUND, 0, (LPARAM)url_heap);
+                }
+            }
+        }
+        InternetCloseHandle(hInternet);
+    }
+    // After any check, update the timestamp in the registry.
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        SYSTEMTIME st; GetSystemTime(&st);
+        FILETIME now; SystemTimeToFileTime(&st, &now);
+        RegSetValueExW(hKey, L"LastUpdateCheck", 0, REG_QWORD, (const BYTE*)&now, sizeof(now));
+        RegCloseKey(hKey);
+    }
+    return 0;
+}
+
+// Checks the registry to see if 24 hours have passed since the last check.
+void CheckForUpdatesIfNeeded() {
+    HKEY hKey;
+    FILETIME lastCheck = {};
+    DWORD dataSize = sizeof(lastCheck);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"LastUpdateCheck", NULL, NULL, (LPBYTE)&lastCheck, &dataSize);
+        RegCloseKey(hKey);
+    }
+    FILETIME now;
+    SYSTEMTIME st; GetSystemTime(&st);
+    SystemTimeToFileTime(&st, &now);
+    ULONGLONG lastCheckInt = ((ULONGLONG)lastCheck.dwHighDateTime << 32) + lastCheck.dwLowDateTime;
+    ULONGLONG nowInt = ((ULONGLONG)now.dwHighDateTime << 32) + now.dwLowDateTime;
+    ULONGLONG twentyFourHours = 24ULL * 60 * 60 * 1000 * 10000;
+    if ((nowInt - lastCheckInt) > twentyFourHours) {
+        HANDLE hThread = CreateThread(NULL, 0, PerformUpdateCheck, NULL, 0, NULL);
+        if (hThread) CloseHandle(hThread); // Fire-and-forget the thread.
+    }
+}
+
+
+//------------------------------------------------------------------------------------------------//
 //                                  FILE WATCHER WORKER THREAD                                    //
 //------------------------------------------------------------------------------------------------//
-// Runs on a background thread to efficiently monitor the settings directory using asynchronous I/O
-// (`ReadDirectoryChangesW`) and notifies the main thread of changes.
+// Monitors the settings directory using asynchronous I/O and notifies the main thread of changes.
 DWORD WINAPI FileWatcherThread(LPVOID)
 {
     wchar_t appDataPath[MAX_PATH];
@@ -224,11 +352,10 @@ DWORD WINAPI FileWatcherThread(LPVOID)
             ResetEvent(overlapped.hEvent);
         }
         else {
-            break; // An error occurred in WaitForMultipleObjects.
+            break; // An error occurred.
         }
     }
 
-    // Clean up all handles before the thread exits.
     CancelIo(hDir);
     CloseHandle(hDir);
     CloseHandle(overlapped.hEvent);
@@ -239,9 +366,7 @@ DWORD WINAPI FileWatcherThread(LPVOID)
 //------------------------------------------------------------------------------------------------//
 //                          CORE LOGIC & FILE MANAGEMENT                                          //
 //------------------------------------------------------------------------------------------------//
-
-// Gets the full path to extensions.txt in the user's Roaming AppData folder, which is the
-// correct location for user-specific, editable configuration files.
+// Gets path to extensions.txt in %APPDATA%\ClipboardToFile, the correct location for user config.
 std::wstring GetSettingsFilePath()
 {
     wchar_t appDataPath[MAX_PATH];
@@ -250,16 +375,16 @@ std::wstring GetSettingsFilePath()
         CreateDirectoryW(fullPath.c_str(), NULL);
         return fullPath + L"\\extensions.txt";
     }
-    return L"extensions.txt"; // Fallback to local directory (rare).
+    return L"extensions.txt"; // Fallback to local directory.
 }
 
-// Creates a default config file on first run if one doesn't exist, then performs the initial load.
+// Creates a default config file on first run if needed, then performs initial load.
 void InitializeAndLoadExtensions()
 {
     std::wstring settingsPath = GetSettingsFilePath();
     std::wifstream checkFile(settingsPath);
     if (!checkFile.is_open()) {
-        const std::vector<std::wstring> defaultExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml" };
+        const std::vector<std::wstring> defaultExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml", L".cs", L".c"};
         std::wofstream newSettingsFile(settingsPath);
         if (newSettingsFile.is_open()) {
             for (const auto& ext : defaultExtensions) newSettingsFile << ext << std::endl;
@@ -297,7 +422,7 @@ bool ReloadExtensions(bool isInitialLoad)
     }
     settingsFile.close();
 
-    // Atomically swap the old list with the new one for thread safety.
+    // Atomically swap the new list for the old one for thread safety.
     {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
         g_allowedExtensions.swap(tempExtensions);
@@ -335,7 +460,7 @@ void ProcessClipboardChange()
     std::wstring extension(ext);
     std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
 
-    // Check if the extension is in our allowed list (thread-safe read).
+    // Thread-safe read of the allowed extensions list.
     bool isAllowed = false;
     {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
