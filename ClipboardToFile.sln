@@ -1,0 +1,55 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36203.30
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClipboardToFile", "src\ClipboardToFile.vcxproj", "{116154E0-D6C6-4856-A8D3-21CDD80D276D}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{8EC462FD-D22E-90A8-E5CE-7E832BA40C5D}"
+	ProjectSection(SolutionItems) = preProject
+		.gitignore = .gitignore
+		.github\workflows\ci-build.yml = .github\workflows\ci-build.yml
+		README.md = README.md
+		.github\workflows\release.yml = .github\workflows\release.yml
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "assets", "assets", "{02EA681E-C7D8-13C7-8484-4AC65E1B71E8}"
+	ProjectSection(SolutionItems) = preProject
+		assets\ClipboardToFile.ico = assets\ClipboardToFile.ico
+		assets\icon.svg = assets\icon.svg
+		assets\icon_16.png = assets\icon_16.png
+		assets\icon_24.png = assets\icon_24.png
+		assets\icon_256.png = assets\icon_256.png
+		assets\icon_32.png = assets\icon_32.png
+		assets\icon_48.png = assets\icon_48.png
+		assets\icon_64.png = assets\icon_64.png
+		assets\small.ico = assets\small.ico
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Debug|x64.ActiveCfg = Debug|x64
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Debug|x64.Build.0 = Debug|x64
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Debug|x86.ActiveCfg = Debug|Win32
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Debug|x86.Build.0 = Debug|Win32
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Release|x64.ActiveCfg = Release|x64
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Release|x64.Build.0 = Release|x64
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Release|x86.ActiveCfg = Release|Win32
+		{116154E0-D6C6-4856-A8D3-21CDD80D276D}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{02EA681E-C7D8-13C7-8484-4AC65E1B71E8} = {8EC462FD-D22E-90A8-E5CE-7E832BA40C5D}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {8AAA0B91-774B-47EE-A426-47003E6AAAEC}
+	EndGlobalSection
+EndGlobal
