@@ -495,7 +495,7 @@ void SetStartup(bool enable)
         {
             wchar_t exePath[MAX_PATH];
             GetModuleFileNameW(NULL, exePath, MAX_PATH);
-            RegSetValueExW(hKey, REG_VALUE_NAME, 0, REG_SZ, (const BYTE*)exePath, (wcslen(exePath) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, REG_VALUE_NAME, 0, REG_SZ, (const BYTE*)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
         }
         else
         {
