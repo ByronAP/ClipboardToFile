@@ -6,6 +6,21 @@
 
 A lightweight, high-performance, and dependency-free Windows utility that creates files in the active File Explorer window from text copied to the clipboard. Written in pure C++ with the Win32 API for maximum efficiency and minimal resource usage.
 
+<p align="center">
+  <!-- License Badge - Static -->
+  <a href="https://opensource.org/licenses/MIT">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT">
+  </a>
+  <!-- CI Pipeline Status Badge - Dynamic -->
+  <a href="https://github.com/ByronAP/ClipboardToFile/actions/workflows/ci-build.yml">
+    <img src="https://github.com/ByronAP/ClipboardToFile/actions/workflows/ci-build.yml/badge.svg?branch=dev" alt="CI Build Status">
+  </a>
+  <!-- Latest Release Version Badge - Dynamic -->
+  <a href="https://github.com/ByronAP/ClipboardToFile/releases/latest">
+    <img src="https://img.shields.io/github/v/release/ByronAP/ClipboardToFile" alt="Latest Release">
+  </a>
+</p>
+
 ## The Problem It Solves
 
 As a developer, you often need to create new files (`new_component.js`, `style.css`, `debug.log`, etc.) in your current working directory. The standard workflow involves right-clicking in File Explorer, selecting "New", choosing the file type, and then renaming the file.
