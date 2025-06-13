@@ -204,11 +204,12 @@ AppVersion ParseVersionString(const std::wstring& versionStr) {
 AppVersion GetCurrentAppVersion() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    DWORD handle = 0;
+    DWORD handle = 0; // This is a dummy variable for GetFileVersionInfoSizeW.
     DWORD versionSize = GetFileVersionInfoSizeW(exePath, &handle);
     if (versionSize == 0) return {};
     std::vector<BYTE> versionData(versionSize);
-    if (!GetFileVersionInfoW(exePath, handle, versionSize, versionData.data())) return {};
+    // The second parameter to GetFileVersionInfoW is ignored and per documentation should be 0.
+    if (!GetFileVersionInfoW(exePath, 0, versionSize, versionData.data())) return {};
     VS_FIXEDFILEINFO* pFileInfo = nullptr;
     UINT fileInfoSize = 0;
     if (VerQueryValueW(versionData.data(), L"\\", (LPVOID*)&pFileInfo, &fileInfoSize) && pFileInfo) {
@@ -228,9 +229,11 @@ const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
 DWORD WINAPI PerformUpdateCheck(LPVOID) {
     HINTERNET hInternet = InternetOpenW(L"ClipboardToFile/1.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (hInternet) {
+        // Explicitly define headers and calculate length to satisfy static analysis.
+        const wchar_t* headers = L"User-Agent: ClipboardToFile-Update-Check\r\n";
         HINTERNET hConnect = InternetOpenUrlW(hInternet,
             L"https://api.github.com/repos/ByronAP/ClipboardToFile/releases/latest",
-            L"User-Agent: ClipboardToFile-Update-Check\r\n", -1L,
+            headers, (DWORD)wcslen(headers),
             INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
         if (hConnect) {
             std::string response;
@@ -384,7 +387,7 @@ void InitializeAndLoadExtensions()
     std::wstring settingsPath = GetSettingsFilePath();
     std::wifstream checkFile(settingsPath);
     if (!checkFile.is_open()) {
-        const std::vector<std::wstring> defaultExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml", L".cs", L".c"};
+        const std::vector<std::wstring> defaultExtensions = { L".txt", L".md", L".log", L".sql", L".cpp", L".h", L".js", L".json", L".xml", L".cs", L".c" };
         std::wofstream newSettingsFile(settingsPath);
         if (newSettingsFile.is_open()) {
             for (const auto& ext : defaultExtensions) newSettingsFile << ext << std::endl;
@@ -541,7 +544,6 @@ std::wstring GetSingleExplorerPath()
 //                                  TRAY ICON & UI MANAGEMENT                                     //
 //------------------------------------------------------------------------------------------------//
 
-// Adds the icon to the system tray.
 void CreateTrayIcon(HWND hwnd)
 {
     NOTIFYICONDATAW nid = {};
