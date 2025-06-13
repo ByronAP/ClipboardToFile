@@ -67,6 +67,13 @@ struct AppSettings {
 };
 AppSettings g_settings;
 
+// Enum for file conflict resolution actions
+enum class FileConflictAction {
+    Replace,
+    Skip,
+    Rename
+};
+
 
 //------------------------------------------------------------------------------------------------//
 //                                  FUNCTION PROTOTYPES                                           //
@@ -91,6 +98,8 @@ int CountWords(const std::wstring&);
 struct AppVersion { int major = 0, minor = 0, patch = 0, build = 0; };
 AppVersion GetCurrentAppVersion();
 AppVersion ParseVersionString(const std::wstring&);
+FileConflictAction ShowFileConflictDialog(const std::wstring&);
+std::wstring GenerateUniqueFilename(const std::wstring&);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -489,6 +498,59 @@ DWORD WINAPI FileWatcherThread(LPVOID)
 
 
 //------------------------------------------------------------------------------------------------//
+//                          FILE CONFLICT RESOLUTION                                              //
+//------------------------------------------------------------------------------------------------//
+// Shows a dialog asking the user what to do when a file already exists
+FileConflictAction ShowFileConflictDialog(const std::wstring& filename)
+{
+    std::wstring message = L"The file '" + filename + L"' already exists.\n\n"
+        L"What would you like to do?\n\n"
+        L"Yes = Replace (overwrite the existing file)\n"
+        L"No = Skip (do not create the file)\n"
+        L"Cancel = Rename (create with a different name)";
+
+    int result = MessageBoxW(g_hMainWnd,
+        message.c_str(),
+        L"File Already Exists",
+        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+
+    switch (result) {
+    case IDYES: return FileConflictAction::Replace;
+    case IDNO: return FileConflictAction::Skip;
+    case IDCANCEL: return FileConflictAction::Rename;
+    default: return FileConflictAction::Skip;
+    }
+}
+
+// Generates a unique filename by appending a number to the base name
+std::wstring GenerateUniqueFilename(const std::wstring& originalPath)
+{
+    if (GetFileAttributesW(originalPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return originalPath; // Original doesn't exist, use it
+    }
+
+    wchar_t drive[_MAX_DRIVE];
+    wchar_t dir[_MAX_DIR];
+    wchar_t fname[_MAX_FNAME];
+    wchar_t ext[_MAX_EXT];
+
+    _wsplitpath_s(originalPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+    int counter = 1;
+    std::wstring newPath;
+
+    do {
+        std::wstringstream ss;
+        ss << drive << dir << fname << L" (" << counter << L")" << ext;
+        newPath = ss.str();
+        counter++;
+    } while (GetFileAttributesW(newPath.c_str()) != INVALID_FILE_ATTRIBUTES && counter < 1000);
+
+    return newPath;
+}
+
+
+//------------------------------------------------------------------------------------------------//
 //                          CORE LOGIC & FILE MANAGEMENT                                          //
 //------------------------------------------------------------------------------------------------//
 // A simple helper to count words in a string, used by the content-creation heuristic.
@@ -567,15 +629,36 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
         std::wstring explorerPath = GetSingleExplorerPath();
         if (!explorerPath.empty()) {
             std::wstring fullPath = explorerPath + L"\\" + filename;
-            if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                std::wofstream outFile(fullPath);
-                if (outFile.is_open()) {
-                    outFile << content;
-                    outFile.close();
-                    std::wstring successMessage = L"Generated file with content: " + filename;
-                    ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
-                    return true;
+            std::wstring finalPath = fullPath;
+
+            // Check if file exists and handle conflict
+            if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                FileConflictAction action = ShowFileConflictDialog(filename);
+
+                switch (action) {
+                case FileConflictAction::Skip:
+                    return true; // User chose to skip, don't create file
+                case FileConflictAction::Rename:
+                    finalPath = GenerateUniqueFilename(fullPath);
+                    // Extract just the filename for the success message
+                    wchar_t fname[_MAX_FNAME];
+                    wchar_t ext[_MAX_EXT];
+                    _wsplitpath_s(finalPath.c_str(), NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+                    filename = std::wstring(fname) + ext;
+                    break;
+                case FileConflictAction::Replace:
+                    // Continue with original path, will overwrite
+                    break;
                 }
+            }
+
+            std::wofstream outFile(finalPath);
+            if (outFile.is_open()) {
+                outFile << content;
+                outFile.close();
+                std::wstring successMessage = L"Generated file with content: " + filename;
+                ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
+                return true;
             }
         }
     }
@@ -612,17 +695,39 @@ void TryEmptyFileCreation(const std::wstring& clipboardText) {
     std::wstring explorerPath = GetSingleExplorerPath();
     if (!explorerPath.empty()) {
         std::wstring fullPath = explorerPath + L"\\" + filename;
-        if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            try {
-                HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    CloseHandle(hFile);
-                    std::wstring successMessage = L"Created empty file: " + filename;
-                    ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
-                }
+        std::wstring finalPath = fullPath;
+
+        // Check if file exists and handle conflict
+        if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            FileConflictAction action = ShowFileConflictDialog(filename);
+
+            switch (action) {
+            case FileConflictAction::Skip:
+                return; // User chose to skip, don't create file
+            case FileConflictAction::Rename:
+                finalPath = GenerateUniqueFilename(fullPath);
+                // Extract just the filename for the success message
+                wchar_t fname[_MAX_FNAME];
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(finalPath.c_str(), NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+                filename = std::wstring(fname) + ext;
+                break;
+            case FileConflictAction::Replace:
+                // For empty files, we'll delete the existing file first
+                DeleteFileW(fullPath.c_str());
+                break;
             }
-            catch (...) {}
         }
+
+        try {
+            HANDLE hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                std::wstring successMessage = L"Created empty file: " + filename;
+                ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
+            }
+        }
+        catch (...) {}
     }
 }
 
