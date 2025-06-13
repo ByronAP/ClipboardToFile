@@ -1,0 +1,64 @@
+<svg width="256" height="256" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" version="1.1">
+  <defs>
+    <!-- Gradient for the clipboard clip -->
+    <linearGradient id="clipGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#d0d0d0;" />
+      <stop offset="100%" style="stop-color:#a0a0a0;" />
+    </linearGradient>
+    
+    <!-- Gradient for the folder -->
+    <linearGradient id="folderGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#6ea2e0;" />
+      <stop offset="100%" style="stop-color:#4a8ad8;" />
+    </linearGradient>
+  </defs>
+
+  <!-- Folder Back -->
+  <rect 
+    x="5" y="25" 
+    width="90" height="65" 
+    rx="8" ry="8" 
+    fill="url(#folderGradient)" 
+    stroke="#3a72b8" 
+    stroke-width="2.5" />
+    
+  <!-- Clipboard Board (peeking out) -->
+  <rect 
+    x="22" y="15" 
+    width="56" height="70" 
+    rx="7" ry="7" 
+    fill="#eef2f9" 
+    stroke="#aab8d1" 
+    stroke-width="2" />
+    
+  <!-- Clip Mechanism Group -->
+  <g stroke="#4f5b70" stroke-width="1.2">
+    <!-- Main clip body -->
+    <rect 
+      x="35" y="10" 
+      width="30" height="15" 
+      rx="4" ry="4" 
+      fill="url(#clipGradient)" />
+      
+    <!-- Clip hinge on top -->
+    <rect 
+      x="42.5" y="6" 
+      width="15" height="5.5" 
+      rx="2" ry="2" 
+      fill="#8c96a9" />
+  </g>
+  
+  <!-- Folder Front -->
+  <path d="M 95,45 
+           C 95,35 90,32 85,32 
+           L 35,32 
+           C 30,32 25,35 25,40 
+           L 5,40 5,82 
+           C 5,90 13,90 13,90 
+           L 87,90 
+           C 87,90 95,90 95,82 Z"
+        fill="url(#folderGradient)" 
+        stroke="#3a72b8" 
+        stroke-width="2.5" />
+        
+</svg>
