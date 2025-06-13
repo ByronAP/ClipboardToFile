@@ -42,6 +42,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          generate_release_notes: true
+
+          body: |
+            - `ClipboardToFile-Setup.exe` — The recommended installer for most users.
+            - `ClipboardToFile-Portable.zip` — A portable version (no installation required).
+
           name: Release v${{ env.VERSION_MM }}.${{ github.run_number }}
           tag_name: v${{ env.VERSION_MM }}.${{ github.run_number }}
           files: |
