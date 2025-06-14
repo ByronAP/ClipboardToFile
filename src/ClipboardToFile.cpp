@@ -143,7 +143,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_CREATE:
         // This message is sent once when the window is first created.
         LoadSettings();
-        g_hNextClipboardViewer = SetClipboardViewer(hwnd);
+        // Use modern clipboard listener API (Vista+) instead of legacy viewer chain
+        AddClipboardFormatListener(hwnd);
         CreateTrayIcon(hwnd);
         g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         g_hWatcherThread = CreateThread(NULL, 0, FileWatcherThread, NULL, 0, NULL);
@@ -167,25 +168,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        ChangeClipboardChain(hwnd, g_hNextClipboardViewer);
+        // Remove modern clipboard listener (no chain management needed)
+        RemoveClipboardFormatListener(hwnd);
         RemoveTrayIcon(hwnd);
         PostQuitMessage(0);
         break;
-    case WM_CHANGECBCHAIN:
-        // A window is being removed from the clipboard viewer chain.
-        if ((HWND)wParam == g_hNextClipboardViewer) g_hNextClipboardViewer = (HWND)lParam;
-        else if (g_hNextClipboardViewer != NULL) SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
-        break;
-    case WM_DRAWCLIPBOARD:
-        // The content of the clipboard has changed.
+    case WM_CLIPBOARDUPDATE:
+        // Modern clipboard change notification (Vista+) - more reliable than legacy chain
         if (g_bIgnoreNextClipboard) {
             g_bIgnoreNextClipboard = false;  // Reset flag after ignoring first notification
         }
         else {
             ProcessClipboardChange();
         }
-        // CRITICAL: We must pass this message on to the next window in the chain.
-        SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
+        // No message forwarding needed with modern API - each listener gets direct notification
         break;
     case WM_APP_RELOAD_CONFIG:
         // Handles the reload request from our file watcher thread.
