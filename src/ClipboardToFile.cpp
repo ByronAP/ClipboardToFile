@@ -157,6 +157,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CloseHandle(g_hWatcherThread);
         }
         if (g_hShutdownEvent) CloseHandle(g_hShutdownEvent);
+
+        // Clean up any pending WM_APP_UPDATE_FOUND messages to prevent memory leaks
+        MSG pendingMsg;
+        while (PeekMessageW(&pendingMsg, hwnd, WM_APP_UPDATE_FOUND, WM_APP_UPDATE_FOUND, PM_REMOVE)) {
+            wchar_t* releaseUrl = (wchar_t*)pendingMsg.lParam;
+            if (releaseUrl) {
+                delete[] releaseUrl; // Free the memory allocated by PerformUpdateCheck
+            }
+        }
+
         ChangeClipboardChain(hwnd, g_hNextClipboardViewer);
         RemoveTrayIcon(hwnd);
         PostQuitMessage(0);
