@@ -58,6 +58,8 @@ HANDLE g_hWatcherThread = NULL;
 HANDLE g_hShutdownEvent = NULL;
 std::mutex g_extensionsMutex;
 
+bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+
 struct AppSettings {
     bool isCreateEmptyFileEnabled = true;
     bool isCreateWithContentEnabled = true;
@@ -164,7 +166,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_DRAWCLIPBOARD:
         // The content of the clipboard has changed.
+        if (g_bIgnoreNextClipboard) {
+            g_bIgnoreNextClipboard = false;  // Reset flag after ignoring first notification
+        }
+        else {
         ProcessClipboardChange();
+        }
         // CRITICAL: We must pass this message on to the next window in the chain.
         SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
         break;
