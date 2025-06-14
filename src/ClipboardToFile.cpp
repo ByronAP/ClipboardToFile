@@ -105,6 +105,7 @@ FileConflictAction ShowFileConflictDialog(const std::wstring&);
 std::wstring GenerateUniqueFilename(const std::wstring&);
 bool CreateFileWithContentAtomic(const std::wstring&, const std::wstring&);
 bool CreateEmptyFileAtomic(const std::wstring&);
+bool IsValidFilename(const std::wstring&);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -636,9 +637,10 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
     if (format_detected) {
         filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
         filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
-        if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) {
+        if (!IsValidFilename(filename)) {
             return true; // Detected a pattern but filename is invalid. Stop all further processing.
         }
+
         std::wstring content = clipboardText.substr(first_line_end + 1);
         std::wstring explorerPath = GetSingleExplorerPath();
         if (!explorerPath.empty()) {
@@ -698,7 +700,9 @@ void TryEmptyFileCreation(const std::wstring& clipboardText) {
     std::wstring filename = clipboardText;
     filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
     filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
-    if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) return;
+    if (!IsValidFilename(filename)) {
+        return; // Detected a pattern but filename is invalid. Stop all further processing.
+    }
 
     // To avoid ambiguity, don't treat multi-line text as an empty filename.
     if (filename.find(L'\n') != std::wstring::npos) return;
@@ -1037,4 +1041,105 @@ void SetStartup(bool enable)
         }
         RegCloseKey(hKey);
     }
+}
+
+//------------------------------------------------------------------------------------------------//
+//                          FILE SECURITY & PATH VALIDATION                                       //
+//------------------------------------------------------------------------------------------------//
+// Comprehensive filename validation to prevent security issues and filesystem errors
+bool IsValidFilename(const std::wstring& filename)
+{
+    // Check for empty filename
+    if (filename.empty()) {
+        return false;
+    }
+
+    // Check filename length (Windows has a 255 character limit for filenames)
+    if (filename.length() > 255) {
+        return false;
+    }
+
+    // Check for path traversal attempts
+    if (filename.find(L"../") != std::wstring::npos || filename.find(L"..\\") != std::wstring::npos) {
+        return false;
+    }
+
+    // Check for absolute paths (should only be relative filenames)
+    if (filename.length() >= 2 && filename[1] == L':') { // Drive letter (C:, D:, etc.)
+        return false;
+    }
+    if (filename[0] == L'\\' || filename[0] == L'/') { // UNC paths or root paths
+        return false;
+    }
+
+    // Check for invalid characters in Windows filenames
+    const wchar_t* invalidChars = L"\\/:*?\"<>|";
+    if (filename.find_first_of(invalidChars) != std::wstring::npos) {
+        return false;
+    }
+
+    // Check for control characters (0x00-0x1F)
+    for (wchar_t c : filename) {
+        if (c >= 0x00 && c <= 0x1F) {
+            return false;
+        }
+    }
+
+    // Check for reserved Windows device names (case-insensitive)
+    std::wstring upperFilename = filename;
+    std::transform(upperFilename.begin(), upperFilename.end(), upperFilename.begin(), ::towupper);
+
+    // Extract base name without extension for reserved name checking
+    std::wstring baseName = upperFilename;
+    size_t dotPos = baseName.find_last_of(L'.');
+    if (dotPos != std::wstring::npos) {
+        baseName = baseName.substr(0, dotPos);
+    }
+
+    // Check basic reserved device names
+    const std::vector<std::wstring> basicReservedNames = {
+        L"CON", L"PRN", L"AUX", L"NUL"
+    };
+
+    for (const auto& reserved : basicReservedNames) {
+        if (baseName == reserved) {
+            return false;
+        }
+    }
+
+    // Check COM ports (COMx where x is any number)
+    if (baseName.length() >= 4 && baseName.substr(0, 3) == L"COM") {
+        std::wstring numberPart = baseName.substr(3);
+        if (!numberPart.empty() && std::all_of(numberPart.begin(), numberPart.end(), ::iswdigit)) {
+            return false;
+        }
+    }
+
+    // Check LPT ports (LPTx where x is any number)
+    if (baseName.length() >= 4 && baseName.substr(0, 3) == L"LPT") {
+        std::wstring numberPart = baseName.substr(3);
+        if (!numberPart.empty() && std::all_of(numberPart.begin(), numberPart.end(), ::iswdigit)) {
+            return false;
+        }
+    }
+
+    // Check for filenames ending with period (not allowed in Windows)
+    // Note: Leading/trailing spaces are handled by trimming before this function is called
+    if (filename.back() == L'.') {
+        return false;
+    }
+
+    // Additional check: ensure filename doesn't contain only dots
+    bool onlyDots = true;
+    for (wchar_t c : filename) {
+        if (c != L'.') {
+            onlyDots = false;
+            break;
+        }
+    }
+    if (onlyDots) {
+        return false;
+    }
+
+    return true;
 }
