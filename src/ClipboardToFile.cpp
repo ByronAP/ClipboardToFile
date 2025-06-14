@@ -58,6 +58,8 @@ HANDLE g_hWatcherThread = NULL;
 HANDLE g_hShutdownEvent = NULL;
 std::mutex g_extensionsMutex;
 
+bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+
 struct AppSettings {
     bool isCreateEmptyFileEnabled = true;
     bool isCreateWithContentEnabled = true;
@@ -100,6 +102,8 @@ AppVersion GetCurrentAppVersion();
 AppVersion ParseVersionString(const std::wstring&);
 FileConflictAction ShowFileConflictDialog(const std::wstring&);
 std::wstring GenerateUniqueFilename(const std::wstring&);
+bool CreateFileWithContentAtomic(const std::wstring&, const std::wstring&);
+bool CreateEmptyFileAtomic(const std::wstring&);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -164,7 +168,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_DRAWCLIPBOARD:
         // The content of the clipboard has changed.
-        ProcessClipboardChange();
+        if (g_bIgnoreNextClipboard) {
+            g_bIgnoreNextClipboard = false;  // Reset flag after ignoring first notification
+        }
+        else {
+            ProcessClipboardChange();
+        }
         // CRITICAL: We must pass this message on to the next window in the chain.
         SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
         break;
@@ -509,7 +518,7 @@ FileConflictAction ShowFileConflictDialog(const std::wstring& filename)
         L"No = Skip (do not create the file)\n"
         L"Cancel = Rename (create with a different name)";
 
-    int result = MessageBoxW(g_hMainWnd,
+    int result = MessageBoxW(NULL,
         message.c_str(),
         L"File Already Exists",
         MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
@@ -647,15 +656,28 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
                     filename = std::wstring(fname) + ext;
                     break;
                 case FileConflictAction::Replace:
-                    // Continue with original path, will overwrite
+                    // Will use atomic replacement
                     break;
                 }
             }
 
-            std::wofstream outFile(finalPath);
-            if (outFile.is_open()) {
-                outFile << content;
-                outFile.close();
+            bool success = false;
+
+            if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // File exists and user chose to replace - use atomic replacement
+                success = CreateFileWithContentAtomic(finalPath, content);
+            }
+            else {
+                // File doesn't exist - create normally
+                std::wofstream outFile(finalPath);
+                if (outFile.is_open()) {
+                    outFile << content;
+                    outFile.close();
+                    success = !outFile.fail();
+                }
+            }
+
+            if (success) {
                 std::wstring successMessage = L"Generated file with content: " + filename;
                 ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
                 return true;
@@ -664,6 +686,7 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
     }
     return false;
 }
+
 
 // Handles creating an empty file if the entire clipboard text is a valid filename.
 void TryEmptyFileCreation(const std::wstring& clipboardText) {
@@ -713,21 +736,122 @@ void TryEmptyFileCreation(const std::wstring& clipboardText) {
                 filename = std::wstring(fname) + ext;
                 break;
             case FileConflictAction::Replace:
-                // For empty files, we'll delete the existing file first
-                DeleteFileW(fullPath.c_str());
+                // For replace, we'll use atomic replacement with temporary file
                 break;
             }
         }
 
-        try {
+        bool success = false;
+
+        if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            // File exists and user chose to replace - use atomic replacement
+            success = CreateEmptyFileAtomic(finalPath);
+        }
+        else {
+            // File doesn't exist - create normally
             HANDLE hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {
                 CloseHandle(hFile);
-                std::wstring successMessage = L"Created empty file: " + filename;
-                ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
+                success = true;
             }
         }
-        catch (...) {}
+
+        if (success) {
+            std::wstring successMessage = L"Created empty file: " + filename;
+            ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
+        }
+    }
+}
+
+// Helper function for atomic file replacement with content
+bool CreateFileWithContentAtomic(const std::wstring& targetPath, const std::wstring& content) {
+    // Generate temporary filename in same directory
+    wchar_t drive[_MAX_DRIVE];
+    wchar_t dir[_MAX_DIR];
+    wchar_t fname[_MAX_FNAME];
+    wchar_t ext[_MAX_EXT];
+
+    _wsplitpath_s(targetPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+    // Create temporary filename
+    std::wstring tempPath;
+    int counter = 0;
+    do {
+        std::wstringstream ss;
+        ss << drive << dir << fname << L"_tmp_" << counter << ext;
+        tempPath = ss.str();
+        counter++;
+    } while (GetFileAttributesW(tempPath.c_str()) != INVALID_FILE_ATTRIBUTES && counter < 1000);
+
+    if (counter >= 1000) {
+        return false; // Couldn't generate unique temp name
+    }
+
+    // Create the temporary file with content
+    std::wofstream tempFile(tempPath);
+    if (!tempFile.is_open()) {
+        return false;
+    }
+
+    tempFile << content;
+    tempFile.close();
+
+    // Check if write was successful
+    if (tempFile.fail()) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    // Atomically replace the original file with the temporary file
+    if (MoveFileExW(tempPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        return true;
+    }
+    else {
+        // If atomic replacement failed, clean up the temporary file
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+}
+
+// Helper function for atomic file replacement
+bool CreateEmptyFileAtomic(const std::wstring& targetPath) {
+    // Generate temporary filename in same directory
+    wchar_t drive[_MAX_DRIVE];
+    wchar_t dir[_MAX_DIR];
+    wchar_t fname[_MAX_FNAME];
+    wchar_t ext[_MAX_EXT];
+
+    _wsplitpath_s(targetPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+    // Create temporary filename
+    std::wstring tempPath;
+    int counter = 0;
+    do {
+        std::wstringstream ss;
+        ss << drive << dir << fname << L"_tmp_" << counter << ext;
+        tempPath = ss.str();
+        counter++;
+    } while (GetFileAttributesW(tempPath.c_str()) != INVALID_FILE_ATTRIBUTES && counter < 1000);
+
+    if (counter >= 1000) {
+        return false; // Couldn't generate unique temp name
+    }
+
+    // Create the temporary empty file
+    HANDLE hTempFile = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hTempFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(hTempFile);
+
+    // Atomically replace the original file with the temporary file
+    if (MoveFileExW(tempPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        return true;
+    }
+    else {
+        // If atomic replacement failed, clean up the temporary file
+        DeleteFileW(tempPath.c_str());
+        return false;
     }
 }
 
