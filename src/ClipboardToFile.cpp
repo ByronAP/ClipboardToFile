@@ -516,7 +516,7 @@ FileConflictAction ShowFileConflictDialog(const std::wstring& filename)
         L"No = Skip (do not create the file)\n"
         L"Cancel = Rename (create with a different name)";
 
-    int result = MessageBoxW(g_hMainWnd,
+    int result = MessageBoxW(NULL,
         message.c_str(),
         L"File Already Exists",
         MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
