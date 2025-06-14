@@ -52,6 +52,7 @@
 #define ID_MENU_EXIT                1005
 
 const wchar_t CLASS_NAME[] = L"ClipboardToFileWindowClass";
+const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
 HWND  g_hMainWnd = NULL;
 HWND  g_hNextClipboardViewer = NULL;
 HANDLE g_hWatcherThread = NULL;
@@ -371,8 +372,6 @@ AppVersion GetCurrentAppVersion() {
     }
     return {};
 }
-
-const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
 
 // Background thread function that performs the network request to the GitHub API.
 DWORD WINAPI PerformUpdateCheck(LPVOID) {
