@@ -124,6 +124,7 @@ std::wstring GenerateUniqueFilename(const std::wstring&);
 bool CreateFileWithContentAtomic(const std::wstring&, const std::wstring&);
 bool CreateEmptyFileAtomic(const std::wstring&);
 bool IsValidFilename(const std::wstring&);
+std::vector<std::wstring> FindAdditionalFilenames(const std::wstring&, size_t);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -645,7 +646,6 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
     }
     else {
         // Single-line content: treat entire clipboard as "first line" initially
-        // We'll determine if it's empty file vs content file during pattern detection
         firstLine = clipboardText;
         content = L"";
     }
@@ -656,6 +656,7 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
 
     std::wstring filename;
     bool format_detected = false;
+    size_t filename_end_pos = 0;
 
     // Priority 1: Use pre-compiled regex patterns from config (if content creation is enabled)
     if (contentEnabled) {
@@ -666,6 +667,7 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
                 if (std::regex_match(firstLine, match, compiledRegex) && match.size() > 1) {
                     filename = match[1].str();
                     format_detected = true;
+                    filename_end_pos = first_line_end != std::wstring::npos ? first_line_end + 1 : clipboardText.length();
                     break;
                 }
             }
@@ -706,6 +708,7 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
                     content.erase(0, content.find_first_not_of(L" \t")); // Trim leading whitespace
                     filename = firstWord;
                     format_detected = true;
+                    filename_end_pos = firstWordEnd;
 
                     // For this case, we need content creation enabled since we found content
                     if (!contentEnabled) {
@@ -717,6 +720,7 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
                     filename = firstWord;
                     content = L"";
                     format_detected = true;
+                    filename_end_pos = firstWordEnd;
 
                     // For empty file, we need empty file creation enabled
                     if (!emptyEnabled) {
@@ -751,6 +755,7 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
         if (isAllowedExtension && CountWords(firstLine) <= wordCountLimit) {
             filename = firstLine;
             format_detected = true;
+            filename_end_pos = first_line_end != std::wstring::npos ? first_line_end + 1 : clipboardText.length();
 
             // Priority 3 creates empty files, so check if empty file creation is enabled
             if (!emptyEnabled) {
@@ -759,7 +764,142 @@ bool TryFileGeneration(const std::wstring& clipboardText) {
         }
     }
 
-    // If a filename was found by any method, proceed with file creation.
+    // If we found a filename, check if there are more filenames following it
+    if (format_detected && emptyEnabled) {
+        std::vector<std::wstring> allFilenames;
+        allFilenames.push_back(filename);
+
+        // Look for additional filenames using smart line-based logic
+        std::vector<std::wstring> additionalFilenames = FindAdditionalFilenames(clipboardText, filename_end_pos);
+        allFilenames.insert(allFilenames.end(), additionalFilenames.begin(), additionalFilenames.end());
+
+        // If we found multiple filenames, handle as batch creation
+        if (allFilenames.size() >= 2) {
+            std::wstring explorerPath = GetSingleExplorerPath();
+            if (explorerPath.empty()) {
+                ShowToastNotification(g_hMainWnd, L"Error", L"No File Explorer window found.", NIIF_ERROR);
+                return false;
+            }
+
+            // Separate files into existing and new
+            std::vector<std::wstring> newFiles;
+            std::vector<std::wstring> existingFiles;
+
+            for (const auto& fname : allFilenames) {
+                std::wstring fullPath = explorerPath + L"\\" + fname;
+                if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    existingFiles.push_back(fname);
+                }
+                else {
+                    newFiles.push_back(fname);
+                }
+            }
+
+            // Handle existing files if any
+            FileConflictAction conflictAction = FileConflictAction::Skip;
+            if (!existingFiles.empty()) {
+                std::wstring conflictMessage = L"The following files already exist:\n\n";
+                for (size_t i = 0; i < existingFiles.size() && i < 10; ++i) {
+                    conflictMessage += existingFiles[i] + L"\n";
+                }
+                if (existingFiles.size() > 10) {
+                    conflictMessage += L"... and " + std::to_wstring(existingFiles.size() - 10) + L" more\n";
+                }
+                conflictMessage += L"\nChoose action for ALL existing files:\n\n";
+                conflictMessage += L"Yes = Replace all existing files\n";
+                conflictMessage += L"No = Skip all existing files\n";
+                conflictMessage += L"Cancel = Rename all existing files";
+
+                int result = MessageBoxW(NULL, conflictMessage.c_str(), L"Multiple File Conflicts",
+                    MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+
+                switch (result) {
+                case IDYES: conflictAction = FileConflictAction::Replace; break;
+                case IDNO: conflictAction = FileConflictAction::Skip; break;
+                case IDCANCEL: conflictAction = FileConflictAction::Rename; break;
+                default: conflictAction = FileConflictAction::Skip; break;
+                }
+            }
+
+            // Create all files
+            int successCount = 0;
+            int skipCount = 0;
+            std::vector<std::wstring> failedFiles;
+
+            // Create new files first
+            for (const auto& fname : newFiles) {
+                std::wstring fullPath = explorerPath + L"\\" + fname;
+                HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_WRITE, 0, NULL,
+                    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hFile);
+                    successCount++;
+                }
+                else {
+                    failedFiles.push_back(fname);
+                }
+            }
+
+            // Handle existing files based on user choice
+            for (const auto& fname : existingFiles) {
+                if (conflictAction == FileConflictAction::Skip) {
+                    skipCount++;
+                    continue;
+                }
+
+                std::wstring fullPath = explorerPath + L"\\" + fname;
+                std::wstring finalPath = fullPath;
+
+                if (conflictAction == FileConflictAction::Rename) {
+                    finalPath = GenerateUniqueFilename(fullPath);
+                    HANDLE hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, NULL,
+                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        CloseHandle(hFile);
+                        successCount++;
+                    }
+                    else {
+                        failedFiles.push_back(fname);
+                    }
+                }
+                else if (conflictAction == FileConflictAction::Replace) {
+                    if (CreateEmptyFileAtomic(finalPath)) {
+                        successCount++;
+                    }
+                    else {
+                        failedFiles.push_back(fname);
+                    }
+                }
+            }
+
+            // Show results to user
+            std::wstring resultMessage;
+            if (successCount > 0) {
+                resultMessage = L"Successfully created " + std::to_wstring(successCount) + L" files";
+                if (skipCount > 0) {
+                    resultMessage += L", skipped " + std::to_wstring(skipCount) + L" existing files";
+                }
+                if (!failedFiles.empty()) {
+                    resultMessage += L", failed to create " + std::to_wstring(failedFiles.size()) + L" files";
+                }
+                ShowToastNotification(g_hMainWnd, L"Multiple Files Created", resultMessage, NIIF_INFO);
+            }
+            else {
+                resultMessage = L"No files were created";
+                if (skipCount > 0) {
+                    resultMessage += L" (" + std::to_wstring(skipCount) + L" files were skipped)";
+                }
+                if (!failedFiles.empty()) {
+                    resultMessage += L" (" + std::to_wstring(failedFiles.size()) + L" files failed)";
+                }
+                ShowToastNotification(g_hMainWnd, L"File Creation", resultMessage, NIIF_WARNING);
+            }
+
+            return successCount > 0;
+        }
+    }
+
+    // If not multiple files or only found one filename, proceed with original single file logic
     if (format_detected) {
         filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
         filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
@@ -1201,4 +1341,113 @@ bool IsValidFilename(const std::wstring& filename)
     }
 
     return true;
+}
+
+// Smart search for additional filenames using line logic
+std::vector<std::wstring> FindAdditionalFilenames(const std::wstring& text, size_t startPos) {
+    std::vector<std::wstring> filenames;
+
+    // Split remaining text into lines
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text.substr(startPos));
+    std::wstring line;
+
+    while (std::getline(ss, line)) {
+        // Trim whitespace from line
+        line.erase(0, line.find_first_not_of(L" \t\r"));
+        line.erase(line.find_last_not_of(L" \t\r") + 1);
+        lines.push_back(line);
+    }
+
+    if (lines.empty()) return filenames;
+
+    // Check first line for multiple space-separated filenames
+    std::wstringstream firstLineStream(lines[0]);
+    std::wstring word;
+    int wordsInFirstLine = 0;
+    std::vector<std::wstring> firstLineFilenames;
+
+    while (firstLineStream >> word) {
+        wordsInFirstLine++;
+        if (IsValidFilename(word)) {
+            // Check if it has a valid extension
+            wchar_t ext[_MAX_EXT];
+            _wsplitpath_s(word.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
+            std::wstring extension(ext);
+            std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+
+            bool isAllowedExtension = false;
+            int wordCountLimit;
+            {
+                std::lock_guard<std::mutex> lock(g_extensionsMutex);
+                wordCountLimit = g_settings.heuristicWordCountLimit;
+                for (const auto& allowedExt : g_settings.allowedExtensions) {
+                    if (extension == allowedExt) {
+                        isAllowedExtension = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isAllowedExtension && CountWords(word) <= wordCountLimit) {
+                firstLineFilenames.push_back(word);
+            }
+        }
+    }
+
+    // If we found multiple space-separated filenames in first line, return those
+    if (firstLineFilenames.size() > 1) {
+        return firstLineFilenames;
+    }
+
+    // If first line had exactly one valid filename, add it and continue checking other lines
+    if (firstLineFilenames.size() == 1) {
+        filenames.push_back(firstLineFilenames[0]);
+    }
+
+    // Check subsequent lines one by one
+    for (size_t i = 1; i < lines.size(); ++i) {
+        if (lines[i].empty()) {
+            // Empty line - skip and continue checking
+            continue;
+        }
+        else {
+            // Line has content - check if it's a valid filename
+            if (IsValidFilename(lines[i])) {
+                // Check if it has a valid extension
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(lines[i].c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
+                std::wstring extension(ext);
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+
+                bool isAllowedExtension = false;
+                int wordCountLimit;
+                {
+                    std::lock_guard<std::mutex> lock(g_extensionsMutex);
+                    wordCountLimit = g_settings.heuristicWordCountLimit;
+                    for (const auto& allowedExt : g_settings.allowedExtensions) {
+                        if (extension == allowedExt) {
+                            isAllowedExtension = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isAllowedExtension && CountWords(lines[i]) <= wordCountLimit) {
+                    filenames.push_back(lines[i]);
+                    // Continue checking next lines
+                }
+                else {
+                    // Not a valid filename - stop searching
+                    break;
+                }
+            }
+            else {
+                // Line has content but isn't a valid filename - stop searching
+                break;
+            }
+        }
+    }
+
+    return filenames;
 }
