@@ -60,7 +60,7 @@ HANDLE g_hShutdownEvent = NULL;
 std::vector<std::wregex> g_compiledRegexes;
 std::mutex g_extensionsMutex;
 
-bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+bool g_bIgnoreNextClipboard = false;  // Ignore first clipboard notification on startup // TODO: REMOVE not needed anymore
 bool g_bComInitialized = false;  // Track COM initialization state
 
 // Struct to hold both pattern and compiled regex for efficient reuse
@@ -115,8 +115,7 @@ void SaveSettings();
 bool IsStartupEnabled();
 void SetStartup(bool);
 void CheckForUpdatesIfNeeded();
-bool TryFullFileGeneration(const std::wstring&);
-void TryEmptyFileCreation(const std::wstring&);
+bool TryFileGeneration(const std::wstring&);
 int CountWords(const std::wstring&);
 struct AppVersion { int major = 0, minor = 0, patch = 0, build = 0; };
 AppVersion GetCurrentAppVersion();
@@ -624,37 +623,116 @@ int CountWords(const std::wstring& str) {
     return count;
 }
 
-// Heuristically checks for a filename. It first tries matching against user-defined regexes,
-// and if not found, falls back to a simpler "filename on first line" heuristic.
-// Returns true if it successfully creates a file, preventing other logic from running.
-bool TryFullFileGeneration(const std::wstring& clipboardText) {
-    size_t first_line_end = clipboardText.find(L'\n');
-    if (first_line_end == std::wstring::npos) return false;
+// Unified function that handles both empty file generation and file generation with content
+bool TryFileGeneration(const std::wstring& clipboardText) {
+    bool emptyEnabled, contentEnabled;
+    {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        emptyEnabled = g_settings.isCreateEmptyFileEnabled;
+        contentEnabled = g_settings.isCreateWithContentEnabled;
+    }
 
-    std::wstring firstLine = clipboardText.substr(0, first_line_end);
+    if (!emptyEnabled && !contentEnabled) return false;
+
+    size_t first_line_end = clipboardText.find(L'\n');
+
+    std::wstring firstLine;
+    std::wstring content;
+    bool isMultiLine = (first_line_end != std::wstring::npos);
+
+    if (isMultiLine) {
+        // Multi-line content: split at newline
+        firstLine = clipboardText.substr(0, first_line_end);
+        content = clipboardText.substr(first_line_end + 1);
+
+        // If content creation is disabled, don't process multi-line content
+        if (!contentEnabled) return false;
+    }
+    else {
+        // Single-line content: treat entire clipboard as "first line" initially
+        // We'll determine if it's empty file vs content file during pattern detection
+        firstLine = clipboardText;
+        content = L"";
+    }
+
+    // Trim the first line
     firstLine.erase(0, firstLine.find_first_not_of(L" \t\r\n"));
     firstLine.erase(firstLine.find_last_not_of(L" \t\r\n") + 1);
 
     std::wstring filename;
     bool format_detected = false;
 
-    // Priority 1: Use pre-compiled regex patterns from config.
-    std::lock_guard<std::mutex> lock(g_extensionsMutex);
-    for (const auto& compiledRegex : g_compiledRegexes) {
-        try {
-            std::wsmatch match;
-            if (std::regex_match(firstLine, match, compiledRegex) && match.size() > 1) {
-                filename = match[1].str();
-                format_detected = true;
-                break;
+    // Priority 1: Use pre-compiled regex patterns from config (if content creation is enabled)
+    if (contentEnabled) {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        for (const auto& compiledRegex : g_compiledRegexes) {
+            try {
+                std::wsmatch match;
+                if (std::regex_match(firstLine, match, compiledRegex) && match.size() > 1) {
+                    filename = match[1].str();
+                    format_detected = true;
+                    break;
+                }
             }
-        }
-        catch (const std::regex_error&) {
-            continue; // Silently ignore runtime regex errors.
+            catch (const std::regex_error&) {
+                continue; // Silently ignore runtime regex errors.
+            }
         }
     }
 
-    // Priority 2: Fallback to the simpler word-count heuristic.
+    // Priority 2: Check if first word is a filename with content following (single-line only)
+    if (!format_detected && !isMultiLine) {
+        std::wstringstream ss(firstLine);
+        std::wstring firstWord;
+        if (ss >> firstWord) {
+            // Check if first word looks like a filename
+            wchar_t ext[_MAX_EXT];
+            _wsplitpath_s(firstWord.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
+            std::wstring extension(ext);
+            std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+
+            bool isAllowedExtension = false;
+            {
+                std::lock_guard<std::mutex> lock(g_extensionsMutex);
+                for (const auto& allowedExt : g_settings.allowedExtensions) {
+                    if (extension == allowedExt) {
+                        isAllowedExtension = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isAllowedExtension) {
+                // Extract content after the filename
+                size_t firstWordEnd = firstLine.find(firstWord) + firstWord.length();
+                if (firstWordEnd < firstLine.length()) {
+                    // There's content after the filename
+                    content = firstLine.substr(firstWordEnd);
+                    content.erase(0, content.find_first_not_of(L" \t")); // Trim leading whitespace
+                    filename = firstWord;
+                    format_detected = true;
+
+                    // For this case, we need content creation enabled since we found content
+                    if (!contentEnabled) {
+                        return false;
+                    }
+                }
+                else {
+                    // Just the filename, no content - treat as empty file case
+                    filename = firstWord;
+                    content = L"";
+                    format_detected = true;
+
+                    // For empty file, we need empty file creation enabled
+                    if (!emptyEnabled) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Priority 3: Fallback to the simpler word-count heuristic (for both modes)
     if (!format_detected) {
         wchar_t ext[_MAX_EXT];
         _wsplitpath_s(firstLine.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
@@ -662,18 +740,27 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
         std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
 
         bool isAllowedExtension = false;
-        int wordCountLimit = g_settings.heuristicWordCountLimit;
+        int wordCountLimit;
 
-        for (const auto& allowedExt : g_settings.allowedExtensions) {
-            if (extension == allowedExt) {
-                isAllowedExtension = true;
-                break;
+        {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            wordCountLimit = g_settings.heuristicWordCountLimit;
+            for (const auto& allowedExt : g_settings.allowedExtensions) {
+                if (extension == allowedExt) {
+                    isAllowedExtension = true;
+                    break;
+                }
             }
         }
 
         if (isAllowedExtension && CountWords(firstLine) <= wordCountLimit) {
             filename = firstLine;
             format_detected = true;
+
+            // Priority 3 creates empty files, so check if empty file creation is enabled
+            if (!emptyEnabled) {
+                return false;
+            }
         }
     }
 
@@ -685,7 +772,6 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
             return true; // Detected a pattern but filename is invalid. Stop all further processing.
         }
 
-        std::wstring content = clipboardText.substr(first_line_end + 1);
         std::wstring explorerPath = GetSingleExplorerPath();
         if (!explorerPath.empty()) {
             std::wstring fullPath = explorerPath + L"\\" + filename;
@@ -714,106 +800,48 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
 
             bool success = false;
 
-            if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                // File exists and user chose to replace - use atomic replacement
-                success = CreateFileWithContentAtomic(finalPath, content);
+            if (content.empty()) {
+                // Create empty file (single-line content or multi-line with empty content)
+                if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    success = CreateEmptyFileAtomic(finalPath);
+                }
+                else {
+                    HANDLE hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        CloseHandle(hFile);
+                        success = true;
+                    }
+                }
+
+                if (success) {
+                    std::wstring successMessage = L"Created empty file: " + filename;
+                    ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
+                }
             }
             else {
-                // File doesn't exist - create normally
-                std::wofstream outFile(finalPath);
-                if (outFile.is_open()) {
-                    outFile << content;
-                    outFile.close();
-                    success = !outFile.fail();
+                // Create file with content (multi-line content)
+                if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    success = CreateFileWithContentAtomic(finalPath, content);
+                }
+                else {
+                    std::wofstream outFile(finalPath);
+                    if (outFile.is_open()) {
+                        outFile << content;
+                        outFile.close();
+                        success = !outFile.fail();
+                    }
+                }
+
+                if (success) {
+                    std::wstring successMessage = L"Generated file with content: " + filename;
+                    ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
                 }
             }
 
-            if (success) {
-                std::wstring successMessage = L"Generated file with content: " + filename;
-                ShowToastNotification(g_hMainWnd, L"File Generated", successMessage, NIIF_INFO);
-                return true;
-            }
+            return success;
         }
     }
     return false;
-}
-
-
-// Handles creating an empty file if the entire clipboard text is a valid filename.
-void TryEmptyFileCreation(const std::wstring& clipboardText) {
-    std::wstring filename = clipboardText;
-    filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
-    filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
-    if (!IsValidFilename(filename)) {
-        return; // Detected a pattern but filename is invalid. Stop all further processing.
-    }
-
-    // To avoid ambiguity, don't treat multi-line text as an empty filename.
-    if (filename.find(L'\n') != std::wstring::npos) return;
-
-    wchar_t ext[_MAX_EXT];
-    _wsplitpath_s(filename.c_str(), NULL, 0, NULL, 0, NULL, 0, ext, _MAX_EXT);
-    std::wstring extension(ext);
-    std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
-
-    // Thread-safe read of the allowed extensions list.
-    bool isAllowed = false;
-    {
-        std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        for (const auto& allowedExt : g_settings.allowedExtensions) {
-            if (extension == allowedExt) { isAllowed = true; break; }
-        }
-    }
-
-    if (!isAllowed) return;
-
-    // Safety check: only proceed if exactly one File Explorer window is open.
-    std::wstring explorerPath = GetSingleExplorerPath();
-    if (!explorerPath.empty()) {
-        std::wstring fullPath = explorerPath + L"\\" + filename;
-        std::wstring finalPath = fullPath;
-
-        // Check if file exists and handle conflict
-        if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            FileConflictAction action = ShowFileConflictDialog(filename);
-
-            switch (action) {
-            case FileConflictAction::Skip:
-                return; // User chose to skip, don't create file
-            case FileConflictAction::Rename:
-                finalPath = GenerateUniqueFilename(fullPath);
-                // Extract just the filename for the success message
-                wchar_t fname[_MAX_FNAME];
-                wchar_t ext[_MAX_EXT];
-                _wsplitpath_s(finalPath.c_str(), NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
-                filename = std::wstring(fname) + ext;
-                break;
-            case FileConflictAction::Replace:
-                // For replace, we'll use atomic replacement with temporary file
-                break;
-            }
-        }
-
-        bool success = false;
-
-        if (GetFileAttributesW(finalPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            // File exists and user chose to replace - use atomic replacement
-            success = CreateEmptyFileAtomic(finalPath);
-        }
-        else {
-            // File doesn't exist - create normally
-            HANDLE hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                CloseHandle(hFile);
-                success = true;
-            }
-        }
-
-        if (success) {
-            std::wstring successMessage = L"Created empty file: " + filename;
-            ShowToastNotification(g_hMainWnd, L"File Created", successMessage, NIIF_INFO);
-        }
-    }
 }
 
 // Helper function for atomic file replacement with content
@@ -911,33 +939,18 @@ bool CreateEmptyFileAtomic(const std::wstring& targetPath) {
 // Main dispatcher called on every clipboard change.
 void ProcessClipboardChange()
 {
-    bool emptyEnabled, contentEnabled;
-    {
-        std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        emptyEnabled = g_settings.isCreateEmptyFileEnabled;
-        contentEnabled = g_settings.isCreateWithContentEnabled;
-    }
-    if (!emptyEnabled && !contentEnabled) return;
-
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(g_hMainWnd)) return;
     HANDLE hData = GetClipboardData(CF_UNICODETEXT);
     if (hData == NULL) { CloseClipboard(); return; }
+
     wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
     if (pszText == NULL) { CloseClipboard(); return; }
     std::wstring clipboardText(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
 
-    // Give "Create with Content" priority if it's enabled.
-    if (contentEnabled) {
-        if (TryFullFileGeneration(clipboardText)) {
-            return; // If it succeeded or handled the event, we are done.
-        }
-    }
-    // Otherwise, try the "Create Empty File" logic if it's enabled.
-    if (emptyEnabled) {
-        TryEmptyFileCreation(clipboardText);
-    }
+    // Single unified function handles all cases
+    TryFileGeneration(clipboardText);
 }
 
 // Uses COM to find and return the path of a single open File Explorer window.
@@ -989,9 +1002,8 @@ std::wstring GetSingleExplorerPath()
         }
         pShellWindows->Release();
     }
-    CoUninitialize();
 
-    if (paths.size() == 1) return paths[0];
+    if (paths.size() >= 1) return paths[0];
     return L"";
 }
 
