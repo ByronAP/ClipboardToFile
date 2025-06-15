@@ -60,7 +60,6 @@ HANDLE g_hShutdownEvent = NULL;
 std::vector<std::wregex> g_compiledRegexes;
 std::mutex g_extensionsMutex;
 
-bool g_bIgnoreNextClipboard = false;  // Ignore first clipboard notification on startup // TODO: REMOVE not needed anymore
 bool g_bComInitialized = false;  // Track COM initialization state
 
 // Struct to hold both pattern and compiled regex for efficient reuse
@@ -206,12 +205,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_CLIPBOARDUPDATE:
         // Modern clipboard change notification (Vista+) - more reliable than legacy chain
-        if (g_bIgnoreNextClipboard) {
-            g_bIgnoreNextClipboard = false;  // Reset flag after ignoring first notification
-        }
-        else {
-            ProcessClipboardChange();
-        }
+        ProcessClipboardChange();
+
         // No message forwarding needed with modern API - each listener gets direct notification
         break;
     case WM_APP_RELOAD_CONFIG:
