@@ -61,6 +61,7 @@ std::vector<std::wregex> g_compiledRegexes;
 std::mutex g_extensionsMutex;
 
 bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+bool g_bComInitialized = false;  // Track COM initialization state
 
 // Struct to hold both pattern and compiled regex for efficient reuse
 struct CompiledRegex {
@@ -162,6 +163,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE:
+        // Initialize COM once at startup for the main thread
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true;
+        }
+
         // This message is sent once when the window is first created.
         LoadSettings();
         // Use modern clipboard listener API (Vista+) instead of legacy viewer chain
@@ -192,6 +198,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Remove modern clipboard listener (no chain management needed)
         RemoveClipboardFormatListener(hwnd);
         RemoveTrayIcon(hwnd);
+        // Uninitialize COM once at shutdown
+        if (g_bComInitialized) {
+            CoUninitialize();
+            g_bComInitialized = false;
+        }
         PostQuitMessage(0);
         break;
     case WM_CLIPBOARDUPDATE:
@@ -935,10 +946,18 @@ std::wstring GetSingleExplorerPath()
     std::vector<std::wstring> paths;
     IShellWindows* pShellWindows = NULL;
 
-    HRESULT hr = CoInitialize(NULL);
-    if (FAILED(hr)) return L"";
+    // Check if COM is initialized, fallback to per-call initialization if not
+    if (!g_bComInitialized) {
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true; // Set flag so future calls know COM is ready
+            // Don't call CoUninitialize() - leave COM initialized for future calls!
+        }
+        else {
+            return L""; // COM initialization failed
+        }
+    }
 
-    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
+    HRESULT hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
     if (SUCCEEDED(hr)) {
         long count;
         pShellWindows->get_Count(&count);
