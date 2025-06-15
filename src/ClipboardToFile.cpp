@@ -52,13 +52,34 @@
 #define ID_MENU_EXIT                1005
 
 const wchar_t CLASS_NAME[] = L"ClipboardToFileWindowClass";
+const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
 HWND  g_hMainWnd = NULL;
 HWND  g_hNextClipboardViewer = NULL;
 HANDLE g_hWatcherThread = NULL;
 HANDLE g_hShutdownEvent = NULL;
+std::vector<std::wregex> g_compiledRegexes;
 std::mutex g_extensionsMutex;
 
 bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+bool g_bComInitialized = false;  // Track COM initialization state
+
+// Struct to hold both pattern and compiled regex for efficient reuse
+struct CompiledRegex {
+    std::wstring pattern;
+    std::wregex compiled;
+    bool isValid;
+
+    CompiledRegex() : isValid(false) {}
+    CompiledRegex(const std::wstring& pat) : pattern(pat), isValid(false) {
+        try {
+            compiled = std::wregex(pattern, std::regex::ECMAScript | std::regex::icase);
+            isValid = true;
+        }
+        catch (const std::regex_error&) {
+            isValid = false;
+        }
+    }
+};
 
 struct AppSettings {
     bool isCreateEmptyFileEnabled = true;
@@ -104,6 +125,7 @@ FileConflictAction ShowFileConflictDialog(const std::wstring&);
 std::wstring GenerateUniqueFilename(const std::wstring&);
 bool CreateFileWithContentAtomic(const std::wstring&, const std::wstring&);
 bool CreateEmptyFileAtomic(const std::wstring&);
+bool IsValidFilename(const std::wstring&);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -141,9 +163,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE:
+        // Initialize COM once at startup for the main thread
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true;
+        }
+
         // This message is sent once when the window is first created.
         LoadSettings();
-        g_hNextClipboardViewer = SetClipboardViewer(hwnd);
+        // Use modern clipboard listener API (Vista+) instead of legacy viewer chain
+        AddClipboardFormatListener(hwnd);
         CreateTrayIcon(hwnd);
         g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         g_hWatcherThread = CreateThread(NULL, 0, FileWatcherThread, NULL, 0, NULL);
@@ -157,25 +185,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CloseHandle(g_hWatcherThread);
         }
         if (g_hShutdownEvent) CloseHandle(g_hShutdownEvent);
-        ChangeClipboardChain(hwnd, g_hNextClipboardViewer);
+
+        // Clean up any pending WM_APP_UPDATE_FOUND messages to prevent memory leaks
+        MSG pendingMsg;
+        while (PeekMessageW(&pendingMsg, hwnd, WM_APP_UPDATE_FOUND, WM_APP_UPDATE_FOUND, PM_REMOVE)) {
+            wchar_t* releaseUrl = (wchar_t*)pendingMsg.lParam;
+            if (releaseUrl) {
+                delete[] releaseUrl; // Free the memory allocated by PerformUpdateCheck
+            }
+        }
+
+        // Remove modern clipboard listener (no chain management needed)
+        RemoveClipboardFormatListener(hwnd);
         RemoveTrayIcon(hwnd);
+        // Uninitialize COM once at shutdown
+        if (g_bComInitialized) {
+            CoUninitialize();
+            g_bComInitialized = false;
+        }
         PostQuitMessage(0);
         break;
-    case WM_CHANGECBCHAIN:
-        // A window is being removed from the clipboard viewer chain.
-        if ((HWND)wParam == g_hNextClipboardViewer) g_hNextClipboardViewer = (HWND)lParam;
-        else if (g_hNextClipboardViewer != NULL) SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
-        break;
-    case WM_DRAWCLIPBOARD:
-        // The content of the clipboard has changed.
+    case WM_CLIPBOARDUPDATE:
+        // Modern clipboard change notification (Vista+) - more reliable than legacy chain
         if (g_bIgnoreNextClipboard) {
             g_bIgnoreNextClipboard = false;  // Reset flag after ignoring first notification
         }
         else {
             ProcessClipboardChange();
         }
-        // CRITICAL: We must pass this message on to the next window in the chain.
-        SendMessage(g_hNextClipboardViewer, msg, wParam, lParam);
+        // No message forwarding needed with modern API - each listener gets direct notification
         break;
     case WM_APP_RELOAD_CONFIG:
         // Handles the reload request from our file watcher thread.
@@ -264,6 +302,20 @@ std::wstring GetConfigFilePath() {
     return L"config.json"; // Fallback to local directory.
 }
 
+// Helper function to precompile regex patterns (call with mutex already held)
+void CompileRegexPatterns() {
+    g_compiledRegexes.clear();
+    for (const auto& pattern : g_settings.contentCreationRegexes) {
+        try {
+            g_compiledRegexes.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
+        }
+        catch (const std::regex_error&) {
+            // Skip invalid regex patterns - don't add to compiled list
+            continue;
+        }
+    }
+}
+
 // Writes the current state of the g_settings struct to config.json, persisting user choices.
 void SaveSettings() {
     std::wstring settingsPath = GetConfigFilePath();
@@ -300,7 +352,9 @@ void LoadSettings() {
         {
             std::lock_guard<std::mutex> lock(g_extensionsMutex);
             g_settings = defaults;
+            CompileRegexPatterns();
         }
+        
         SaveSettings(); // Save the new default file.
         return;
     }
@@ -321,6 +375,7 @@ void LoadSettings() {
         }
         else { g_settings.contentCreationRegexes = defaults.contentCreationRegexes; }
         g_settings.heuristicWordCountLimit = j.value("heuristicWordCountLimit", defaults.heuristicWordCountLimit);
+        CompileRegexPatterns();
     }
     catch (const nlohmann::json::parse_error&) {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
@@ -365,8 +420,6 @@ AppVersion GetCurrentAppVersion() {
     }
     return {};
 }
-
-const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
 
 // Background thread function that performs the network request to the GitHub API.
 DWORD WINAPI PerformUpdateCheck(LPVOID) {
@@ -585,23 +638,20 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
     std::wstring filename;
     bool format_detected = false;
 
-    // Priority 1: Iterate through user-defined regex patterns from config.
-    std::vector<std::wstring> regexes;
-    {
-        std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        regexes = g_settings.contentCreationRegexes;
-    }
-    for (const auto& pattern : regexes) {
+    // Priority 1: Use pre-compiled regex patterns from config.
+    std::lock_guard<std::mutex> lock(g_extensionsMutex);
+    for (const auto& compiledRegex : g_compiledRegexes) {
         try {
-            std::wregex rx(pattern, std::regex::ECMAScript | std::regex::icase);
             std::wsmatch match;
-            if (std::regex_match(firstLine, match, rx) && match.size() > 1) {
+            if (std::regex_match(firstLine, match, compiledRegex) && match.size() > 1) {
                 filename = match[1].str();
                 format_detected = true;
                 break;
             }
         }
-        catch (const std::regex_error&) { continue; } // Silently ignore invalid regex patterns.
+        catch (const std::regex_error&) {
+            continue; // Silently ignore runtime regex errors.
+        }
     }
 
     // Priority 2: Fallback to the simpler word-count heuristic.
@@ -612,13 +662,13 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
         std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
 
         bool isAllowedExtension = false;
-        int wordCountLimit = 5;
-        {
-            std::lock_guard<std::mutex> lock(g_extensionsMutex);
-            for (const auto& allowedExt : g_settings.allowedExtensions) {
-                if (extension == allowedExt) { isAllowedExtension = true; break; }
+        int wordCountLimit = g_settings.heuristicWordCountLimit;
+
+        for (const auto& allowedExt : g_settings.allowedExtensions) {
+            if (extension == allowedExt) {
+                isAllowedExtension = true;
+                break;
             }
-            wordCountLimit = g_settings.heuristicWordCountLimit;
         }
 
         if (isAllowedExtension && CountWords(firstLine) <= wordCountLimit) {
@@ -631,9 +681,10 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
     if (format_detected) {
         filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
         filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
-        if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) {
+        if (!IsValidFilename(filename)) {
             return true; // Detected a pattern but filename is invalid. Stop all further processing.
         }
+
         std::wstring content = clipboardText.substr(first_line_end + 1);
         std::wstring explorerPath = GetSingleExplorerPath();
         if (!explorerPath.empty()) {
@@ -693,7 +744,9 @@ void TryEmptyFileCreation(const std::wstring& clipboardText) {
     std::wstring filename = clipboardText;
     filename.erase(0, filename.find_first_not_of(L" \t\n\r"));
     filename.erase(filename.find_last_not_of(L" \t\n\r") + 1);
-    if (filename.empty() || wcspbrk(filename.c_str(), L"\\/:*?\"<>|") != nullptr) return;
+    if (!IsValidFilename(filename)) {
+        return; // Detected a pattern but filename is invalid. Stop all further processing.
+    }
 
     // To avoid ambiguity, don't treat multi-line text as an empty filename.
     if (filename.find(L'\n') != std::wstring::npos) return;
@@ -893,10 +946,18 @@ std::wstring GetSingleExplorerPath()
     std::vector<std::wstring> paths;
     IShellWindows* pShellWindows = NULL;
 
-    HRESULT hr = CoInitialize(NULL);
-    if (FAILED(hr)) return L"";
+    // Check if COM is initialized, fallback to per-call initialization if not
+    if (!g_bComInitialized) {
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true; // Set flag so future calls know COM is ready
+            // Don't call CoUninitialize() - leave COM initialized for future calls!
+        }
+        else {
+            return L""; // COM initialization failed
+        }
+    }
 
-    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
+    HRESULT hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
     if (SUCCEEDED(hr)) {
         long count;
         pShellWindows->get_Count(&count);
@@ -1032,4 +1093,105 @@ void SetStartup(bool enable)
         }
         RegCloseKey(hKey);
     }
+}
+
+//------------------------------------------------------------------------------------------------//
+//                          FILE SECURITY & PATH VALIDATION                                       //
+//------------------------------------------------------------------------------------------------//
+// Comprehensive filename validation to prevent security issues and filesystem errors
+bool IsValidFilename(const std::wstring& filename)
+{
+    // Check for empty filename
+    if (filename.empty()) {
+        return false;
+    }
+
+    // Check filename length (Windows has a 255 character limit for filenames)
+    if (filename.length() > 255) {
+        return false;
+    }
+
+    // Check for path traversal attempts
+    if (filename.find(L"../") != std::wstring::npos || filename.find(L"..\\") != std::wstring::npos) {
+        return false;
+    }
+
+    // Check for absolute paths (should only be relative filenames)
+    if (filename.length() >= 2 && filename[1] == L':') { // Drive letter (C:, D:, etc.)
+        return false;
+    }
+    if (filename[0] == L'\\' || filename[0] == L'/') { // UNC paths or root paths
+        return false;
+    }
+
+    // Check for invalid characters in Windows filenames
+    const wchar_t* invalidChars = L"\\/:*?\"<>|";
+    if (filename.find_first_of(invalidChars) != std::wstring::npos) {
+        return false;
+    }
+
+    // Check for control characters (0x00-0x1F)
+    for (wchar_t c : filename) {
+        if (c >= 0x00 && c <= 0x1F) {
+            return false;
+        }
+    }
+
+    // Check for reserved Windows device names (case-insensitive)
+    std::wstring upperFilename = filename;
+    std::transform(upperFilename.begin(), upperFilename.end(), upperFilename.begin(), ::towupper);
+
+    // Extract base name without extension for reserved name checking
+    std::wstring baseName = upperFilename;
+    size_t dotPos = baseName.find_last_of(L'.');
+    if (dotPos != std::wstring::npos) {
+        baseName = baseName.substr(0, dotPos);
+    }
+
+    // Check basic reserved device names
+    const std::vector<std::wstring> basicReservedNames = {
+        L"CON", L"PRN", L"AUX", L"NUL"
+    };
+
+    for (const auto& reserved : basicReservedNames) {
+        if (baseName == reserved) {
+            return false;
+        }
+    }
+
+    // Check COM ports (COMx where x is any number)
+    if (baseName.length() >= 4 && baseName.substr(0, 3) == L"COM") {
+        std::wstring numberPart = baseName.substr(3);
+        if (!numberPart.empty() && std::all_of(numberPart.begin(), numberPart.end(), ::iswdigit)) {
+            return false;
+        }
+    }
+
+    // Check LPT ports (LPTx where x is any number)
+    if (baseName.length() >= 4 && baseName.substr(0, 3) == L"LPT") {
+        std::wstring numberPart = baseName.substr(3);
+        if (!numberPart.empty() && std::all_of(numberPart.begin(), numberPart.end(), ::iswdigit)) {
+            return false;
+        }
+    }
+
+    // Check for filenames ending with period (not allowed in Windows)
+    // Note: Leading/trailing spaces are handled by trimming before this function is called
+    if (filename.back() == L'.') {
+        return false;
+    }
+
+    // Additional check: ensure filename doesn't contain only dots
+    bool onlyDots = true;
+    for (wchar_t c : filename) {
+        if (c != L'.') {
+            onlyDots = false;
+            break;
+        }
+    }
+    if (onlyDots) {
+        return false;
+    }
+
+    return true;
 }
