@@ -57,9 +57,29 @@ HWND  g_hMainWnd = NULL;
 HWND  g_hNextClipboardViewer = NULL;
 HANDLE g_hWatcherThread = NULL;
 HANDLE g_hShutdownEvent = NULL;
+std::vector<std::wregex> g_compiledRegexes;
 std::mutex g_extensionsMutex;
 
 bool g_bIgnoreNextClipboard = true;  // Ignore first clipboard notification on startup
+bool g_bComInitialized = false;  // Track COM initialization state
+
+// Struct to hold both pattern and compiled regex for efficient reuse
+struct CompiledRegex {
+    std::wstring pattern;
+    std::wregex compiled;
+    bool isValid;
+
+    CompiledRegex() : isValid(false) {}
+    CompiledRegex(const std::wstring& pat) : pattern(pat), isValid(false) {
+        try {
+            compiled = std::wregex(pattern, std::regex::ECMAScript | std::regex::icase);
+            isValid = true;
+        }
+        catch (const std::regex_error&) {
+            isValid = false;
+        }
+    }
+};
 
 struct AppSettings {
     bool isCreateEmptyFileEnabled = true;
@@ -143,6 +163,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE:
+        // Initialize COM once at startup for the main thread
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true;
+        }
+
         // This message is sent once when the window is first created.
         LoadSettings();
         // Use modern clipboard listener API (Vista+) instead of legacy viewer chain
@@ -173,6 +198,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Remove modern clipboard listener (no chain management needed)
         RemoveClipboardFormatListener(hwnd);
         RemoveTrayIcon(hwnd);
+        // Uninitialize COM once at shutdown
+        if (g_bComInitialized) {
+            CoUninitialize();
+            g_bComInitialized = false;
+        }
         PostQuitMessage(0);
         break;
     case WM_CLIPBOARDUPDATE:
@@ -272,6 +302,20 @@ std::wstring GetConfigFilePath() {
     return L"config.json"; // Fallback to local directory.
 }
 
+// Helper function to precompile regex patterns (call with mutex already held)
+void CompileRegexPatterns() {
+    g_compiledRegexes.clear();
+    for (const auto& pattern : g_settings.contentCreationRegexes) {
+        try {
+            g_compiledRegexes.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
+        }
+        catch (const std::regex_error&) {
+            // Skip invalid regex patterns - don't add to compiled list
+            continue;
+        }
+    }
+}
+
 // Writes the current state of the g_settings struct to config.json, persisting user choices.
 void SaveSettings() {
     std::wstring settingsPath = GetConfigFilePath();
@@ -308,7 +352,9 @@ void LoadSettings() {
         {
             std::lock_guard<std::mutex> lock(g_extensionsMutex);
             g_settings = defaults;
+            CompileRegexPatterns();
         }
+        
         SaveSettings(); // Save the new default file.
         return;
     }
@@ -329,6 +375,7 @@ void LoadSettings() {
         }
         else { g_settings.contentCreationRegexes = defaults.contentCreationRegexes; }
         g_settings.heuristicWordCountLimit = j.value("heuristicWordCountLimit", defaults.heuristicWordCountLimit);
+        CompileRegexPatterns();
     }
     catch (const nlohmann::json::parse_error&) {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
@@ -591,23 +638,20 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
     std::wstring filename;
     bool format_detected = false;
 
-    // Priority 1: Iterate through user-defined regex patterns from config.
-    std::vector<std::wstring> regexes;
-    {
-        std::lock_guard<std::mutex> lock(g_extensionsMutex);
-        regexes = g_settings.contentCreationRegexes;
-    }
-    for (const auto& pattern : regexes) {
+    // Priority 1: Use pre-compiled regex patterns from config.
+    std::lock_guard<std::mutex> lock(g_extensionsMutex);
+    for (const auto& compiledRegex : g_compiledRegexes) {
         try {
-            std::wregex rx(pattern, std::regex::ECMAScript | std::regex::icase);
             std::wsmatch match;
-            if (std::regex_match(firstLine, match, rx) && match.size() > 1) {
+            if (std::regex_match(firstLine, match, compiledRegex) && match.size() > 1) {
                 filename = match[1].str();
                 format_detected = true;
                 break;
             }
         }
-        catch (const std::regex_error&) { continue; } // Silently ignore invalid regex patterns.
+        catch (const std::regex_error&) {
+            continue; // Silently ignore runtime regex errors.
+        }
     }
 
     // Priority 2: Fallback to the simpler word-count heuristic.
@@ -618,13 +662,13 @@ bool TryFullFileGeneration(const std::wstring& clipboardText) {
         std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
 
         bool isAllowedExtension = false;
-        int wordCountLimit = 5;
-        {
-            std::lock_guard<std::mutex> lock(g_extensionsMutex);
-            for (const auto& allowedExt : g_settings.allowedExtensions) {
-                if (extension == allowedExt) { isAllowedExtension = true; break; }
+        int wordCountLimit = g_settings.heuristicWordCountLimit;
+
+        for (const auto& allowedExt : g_settings.allowedExtensions) {
+            if (extension == allowedExt) {
+                isAllowedExtension = true;
+                break;
             }
-            wordCountLimit = g_settings.heuristicWordCountLimit;
         }
 
         if (isAllowedExtension && CountWords(firstLine) <= wordCountLimit) {
@@ -902,10 +946,18 @@ std::wstring GetSingleExplorerPath()
     std::vector<std::wstring> paths;
     IShellWindows* pShellWindows = NULL;
 
-    HRESULT hr = CoInitialize(NULL);
-    if (FAILED(hr)) return L"";
+    // Check if COM is initialized, fallback to per-call initialization if not
+    if (!g_bComInitialized) {
+        if (SUCCEEDED(CoInitialize(NULL))) {
+            g_bComInitialized = true; // Set flag so future calls know COM is ready
+            // Don't call CoUninitialize() - leave COM initialized for future calls!
+        }
+        else {
+            return L""; // COM initialization failed
+        }
+    }
 
-    hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
+    HRESULT hr = CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows);
     if (SUCCEEDED(hr)) {
         long count;
         pShellWindows->get_Count(&count);
