@@ -1,0 +1,408 @@
+name: CD - Release v2.0
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'version.txt'
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_PATH: 'src/ClipboardToFile.csproj'
+  SOLUTION_PATH: 'src/ClipboardToFile.sln'
+
+jobs:
+  version-and-tag:
+    name: Generate Version and Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for changelog generation
+
+    - name: Read base version from version.txt
+      id: base_version
+      run: |
+        if [ ! -f version.txt ]; then
+          echo "2.0" > version.txt
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add version.txt
+          git commit -m "Add version.txt"
+          git push
+        fi
+        BASE_VERSION=$(cat version.txt | tr -d '\n\r ')
+        echo "base=$BASE_VERSION" >> $GITHUB_OUTPUT
+        echo "Base version: $BASE_VERSION"
+
+    - name: Calculate new version
+      id: version
+      run: |
+        BASE_VERSION="${{ steps.base_version.outputs.base }}"
+        RELEASE_TYPE="${{ github.event.inputs.release_type || 'patch' }}"
+        IS_PRERELEASE="${{ github.event.inputs.prerelease || 'false' }}"
+        
+        # Get latest tag with same major.minor
+        LATEST_TAG=$(git tag -l "${BASE_VERSION}.*" | sort -V | tail -n1)
+        
+        if [ -z "$LATEST_TAG" ]; then
+          # First release for this major.minor
+          PATCH_VERSION=0
+        else
+          # Extract patch version from latest tag
+          PATCH_VERSION=$(echo $LATEST_TAG | cut -d'.' -f3)
+        fi
+        
+        # Calculate new version based on release type
+        case $RELEASE_TYPE in
+          "patch")
+            NEW_PATCH=$((PATCH_VERSION + 1))
+            NEW_VERSION="${BASE_VERSION}.${NEW_PATCH}"
+            ;;
+          "minor")
+            IFS='.' read -r MAJOR MINOR <<< "$BASE_VERSION"
+            NEW_MINOR=$((MINOR + 1))
+            NEW_VERSION="${MAJOR}.${NEW_MINOR}.0"
+            echo "${MAJOR}.${NEW_MINOR}" > version.txt
+            ;;
+          "major")
+            IFS='.' read -r MAJOR MINOR <<< "$BASE_VERSION"
+            NEW_MAJOR=$((MAJOR + 1))
+            NEW_VERSION="${NEW_MAJOR}.0.0"
+            echo "${NEW_MAJOR}.0" > version.txt
+            ;;
+        esac
+        
+        # Add prerelease suffix if needed
+        if [ "$IS_PRERELEASE" = "true" ]; then
+          NEW_VERSION="${NEW_VERSION}-beta.$(date +%Y%m%d%H%M)"
+        fi
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+        echo "New version: $NEW_VERSION"
+
+    - name: Check if tag exists
+      id: tag_check
+      run: |
+        TAG="v${{ steps.version.outputs.version }}"
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "Tag $TAG already exists!"
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate changelog
+      id: changelog
+      if: steps.tag_check.outputs.exists == 'false'
+      run: |
+        # Get previous tag for changelog range
+        PREVIOUS_TAG=$(git tag -l "v*" | grep -v "beta\|alpha\|rc" | sort -V | tail -n1)
+        
+        if [ -z "$PREVIOUS_TAG" ]; then
+          # First release - get all commits
+          COMMIT_RANGE=""
+          echo "## 🎉 Initial Release" > changelog.md
+          echo "" >> changelog.md
+        else
+          # Get commits since last release
+          COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+          echo "## 🔄 Changes since ${PREVIOUS_TAG}" > changelog.md
+          echo "" >> changelog.md
+        fi
+        
+        # Generate sections
+        echo "### ✨ New Features" >> changelog.md
+        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="feat:" --grep="feature:" | sed 's/^feat: /- /' | sed 's/^feature: /- /' >> changelog.md
+        echo "" >> changelog.md
+        echo "" >> changelog.md
+        
+        echo "### 🐛 Bug Fixes" >> changelog.md
+        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="fix:" --grep="bug:" | sed 's/^fix: /- /' | sed 's/^bug: /- /' >> changelog.md
+        echo "" >> changelog.md
+        echo "" >> changelog.md
+        
+        echo "### 🔧 Improvements" >> changelog.md
+        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="chore:" --grep="refactor:" --grep="perf:" | sed 's/^chore: /- /' | sed 's/^refactor: /- /' | sed 's/^perf: /- /' >> changelog.md
+        echo "" >> changelog.md
+        echo "" >> changelog.md
+        
+        echo "### 📚 Documentation" >> changelog.md
+        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="docs:" | sed 's/^docs: /- /' >> changelog.md
+        echo "" >> changelog.md
+        echo "" >> changelog.md
+        
+        # Add Epic completion info
+        echo "### 🏗️ Epic Progress" >> changelog.md
+        EPIC_COMMITS=$(git log $COMMIT_RANGE --pretty=format:"- %s" --grep="Epic #" --grep="epic #")
+        if [ ! -z "$EPIC_COMMITS" ]; then
+          echo "$EPIC_COMMITS" >> changelog.md
+        else
+          echo "- Continued development on v2.0 roadmap" >> changelog.md
+        fi
+        echo "" >> changelog.md
+        echo "" >> changelog.md
+        
+        # Add technical details
+        echo "### 🔍 Technical Details" >> changelog.md
+        echo "- **Commits in this release:** $(git rev-list $COMMIT_RANGE --count)" >> changelog.md
+        echo "- **Contributors:** $(git log $COMMIT_RANGE --pretty=format:"%an" | sort | uniq | wc -l)" >> changelog.md
+        echo "- **Files changed:** $(git diff --name-only $COMMIT_RANGE | wc -l)" >> changelog.md
+        echo "" >> changelog.md
+        
+        # Add download section
+        echo "### 📥 Downloads" >> changelog.md
+        echo "- **Windows Installer (MSIX)**: Recommended for most users" >> changelog.md
+        echo "- **Portable Version**: No installation required, runs from any folder" >> changelog.md
+        echo "- **Requirements**: Windows 10 version 1809 or later" >> changelog.md
+        
+        # Output for GitHub
+        CHANGELOG_CONTENT=$(cat changelog.md)
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create and push tag
+      if: steps.tag_check.outputs.exists == 'false'
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+        git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.version }}"
+        git push origin "${{ steps.version.outputs.tag }}"
+
+  build-release-artifacts:
+    name: Build Release Artifacts
+    runs-on: windows-latest
+    needs: version-and-tag
+    if: needs.version-and-tag.outputs.version != ''
+    
+    strategy:
+      matrix:
+        platform: [x64, x86]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Update project version
+      run: |
+        $version = "${{ needs.version-and-tag.outputs.version }}"
+        $csprojPath = "${{ env.PROJECT_PATH }}"
+        
+        # Read and update csproj file
+        [xml]$proj = Get-Content $csprojPath
+        
+        # Find or create Version property
+        $versionNode = $proj.Project.PropertyGroup | Where-Object { $_.Version -ne $null } | Select-Object -First 1
+        if (-not $versionNode) {
+          $versionNode = $proj.Project.PropertyGroup[0]
+          if (-not $versionNode) {
+            $versionNode = $proj.CreateElement("PropertyGroup")
+            $proj.Project.AppendChild($versionNode)
+          }
+        }
+        
+        # Set version properties
+        if ($versionNode.Version) {
+          $versionNode.Version = $version
+        } else {
+          $versionElement = $proj.CreateElement("Version")
+          $versionElement.InnerText = $version
+          $versionNode.AppendChild($versionElement)
+        }
+        
+        $proj.Save($csprojPath)
+        Write-Host "Updated version to: $version"
+
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.PROJECT_PATH }}
+
+    - name: Build MSIX Package (Installer)
+      run: |
+        msbuild ${{ env.PROJECT_PATH }} `
+          /p:Configuration=Release `
+          /p:Platform=${{ matrix.platform }} `
+          /p:AppxBundlePlatforms=${{ matrix.platform }} `
+          /p:AppxPackageDir=..\dist\msix\ `
+          /p:AppxBundle=Always `
+          /p:UapAppxPackageBuildMode=StoreUpload
+
+    - name: Build Portable Version (Self-Contained)
+      run: |
+        dotnet publish ${{ env.PROJECT_PATH }} `
+          --configuration Release `
+          --runtime win-${{ matrix.platform }} `
+          --self-contained true `
+          --output ..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable `
+          /p:PublishTrimmed=true `
+          /p:PublishSingleFile=false
+
+    - name: Create portable archive
+      run: |
+        $portableDir = "..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable"
+        $archiveName = "ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable.zip"
+        
+        # Add README to portable version
+        @"
+        # ClipboardToFile v${{ needs.version-and-tag.outputs.version }} - Portable
+        
+        This is the portable version of ClipboardToFile that requires no installation.
+        
+        ## How to Use
+        1. Extract this ZIP file to any folder
+        2. Run ClipboardToFile.exe
+        3. The application will run from this folder
+        
+        ## System Requirements
+        - Windows 10 version 1809 or later
+        - .NET runtime is included (self-contained)
+        
+        ## Support
+        - GitHub: https://github.com/ByronAP/ClipboardToFile
+        - Issues: https://github.com/ByronAP/ClipboardToFile/issues
+        "@ | Out-File -FilePath "$portableDir\README.txt" -Encoding UTF8
+        
+        Compress-Archive -Path "$portableDir\*" -DestinationPath "..\dist\$archiveName"
+
+    - name: Upload MSIX artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: msix-installer-${{ matrix.platform }}
+        path: |
+          dist/msix/**/*.msix
+          dist/msix/**/*.appxsym
+        retention-days: 30
+
+    - name: Upload portable artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: portable-${{ matrix.platform }}
+        path: dist/*.zip
+        retention-days: 30
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [version-and-tag, build-release-artifacts]
+    if: needs.version-and-tag.outputs.version != ''
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release-artifacts
+
+    - name: Organize release files
+      run: |
+        mkdir -p release-files
+        
+        # Move MSIX files
+        find release-artifacts -name "*.msix" -exec cp {} release-files/ \;
+        
+        # Move portable archives
+        find release-artifacts -name "*.zip" -exec cp {} release-files/ \;
+        
+        # List files for verification
+        echo "Release files:"
+        ls -la release-files/
+
+    - name: Create GitHub Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ needs.version-and-tag.outputs.tag }}
+        release_name: "ClipboardToFile ${{ needs.version-and-tag.outputs.version }}"
+        body: ${{ needs.version-and-tag.outputs.changelog }}
+        draft: false
+        prerelease: ${{ needs.version-and-tag.outputs.is_prerelease }}
+
+    - name: Upload release assets
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          const releaseId = '${{ steps.create_release.outputs.id }}';
+          const releaseDir = './release-files';
+          
+          const files = fs.readdirSync(releaseDir);
+          
+          for (const file of files) {
+            const filePath = path.join(releaseDir, file);
+            const stats = fs.statSync(filePath);
+            
+            console.log(`Uploading ${file} (${stats.size} bytes)...`);
+            
+            const contentType = file.endsWith('.msix') ? 'application/octet-stream' : 'application/zip';
+            
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              name: file,
+              data: fs.readFileSync(filePath),
+              headers: {
+                'content-type': contentType,
+                'content-length': stats.size
+              }
+            });
+            
+            console.log(`✅ Uploaded ${file}`);
+          }
+
+  notify-release:
+    name: Notify Release Complete
+    runs-on: ubuntu-latest
+    needs: [version-and-tag, create-github-release]
+    if: always()
+    
+    steps:
+    - name: Release Success Notification
+      if: needs.create-github-release.result == 'success'
+      run: |
+        echo "🎉 Release ${{ needs.version-and-tag.outputs.version }} created successfully!"
+        echo "📦 Includes both MSIX installer and portable versions"
+        echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version-and-tag.outputs.tag }}"
+
+    - name: Release Failure Notification
+      if: needs.create-github-release.result != 'success'
+      run: |
+        echo "❌ Release creation failed!"
+        exit 1
