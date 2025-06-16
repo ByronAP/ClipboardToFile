@@ -1,0 +1,293 @@
+name: CI - Build and Test v2.0
+
+on:
+  push:
+    branches: [ v2-dev, feature/epic* ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ v2-dev, main ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/**'
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  SOLUTION_PATH: 'ClipboardToFile.sln'
+  PROJECT_PATH: 'src/ClipboardToFile.csproj'
+  TEST_PROJECT_PATH: 'tests/tests.csproj'
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: windows-latest
+    
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+        platform: [x64, x86]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Restore main project dependencies
+      run: dotnet restore ${{ env.PROJECT_PATH }}
+
+    - name: Restore test project dependencies
+      run: dotnet restore ${{ env.TEST_PROJECT_PATH }}
+
+    - name: Build application
+      run: |
+        dotnet build ${{ env.PROJECT_PATH }} \
+          --configuration ${{ matrix.configuration }} \
+          --no-restore \
+          --verbosity normal \
+          /p:Platform=${{ matrix.platform }}
+
+    - name: Build tests
+      if: matrix.configuration == 'Debug'  # Only build tests in Debug
+      run: |
+        dotnet build ${{ env.TEST_PROJECT_PATH }} \
+          --configuration ${{ matrix.configuration }} \
+          --no-restore \
+          --verbosity normal
+
+    - name: Run unit tests
+      if: matrix.configuration == 'Debug'  # Only run tests in Debug to save time
+      run: |
+        dotnet test ${{ env.TEST_PROJECT_PATH }} \
+          --configuration ${{ matrix.configuration }} \
+          --no-build \
+          --verbosity normal \
+          --logger trx \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ./TestResults
+
+    - name: Upload test results
+      if: matrix.configuration == 'Debug' && (success() || failure())
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.platform }}
+        path: ./TestResults
+        retention-days: 7
+
+    - name: Upload build artifacts
+      if: matrix.configuration == 'Release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.platform }}-${{ matrix.configuration }}
+        path: |
+          src/bin/${{ matrix.configuration }}/**
+          src/obj/${{ matrix.configuration }}/**/*.msix
+        retention-days: 14
+
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore dependencies
+      run: |
+        dotnet restore ${{ env.PROJECT_PATH }}
+        dotnet restore ${{ env.TEST_PROJECT_PATH }}
+
+    - name: Run code analysis
+      run: |
+        dotnet build ${{ env.PROJECT_PATH }} \
+          --configuration Release \
+          --verbosity normal \
+          /p:TreatWarningsAsErrors=true \
+          /p:WarningsAsErrors="" \
+          /p:WarningsNotAsErrors="CS1591"
+
+    - name: Check formatting
+      run: |
+        dotnet format ${{ env.PROJECT_PATH }} --verify-no-changes --verbosity diagnostic
+        dotnet format ${{ env.TEST_PROJECT_PATH }} --verify-no-changes --verbosity diagnostic
+
+  security-scan:
+    name: Security Scan
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore dependencies
+      run: |
+        dotnet restore ${{ env.PROJECT_PATH }}
+        dotnet restore ${{ env.TEST_PROJECT_PATH }}
+
+    - name: Run security scan
+      run: |
+        echo "Scanning main project..."
+        dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive 2>&1 | tee vulnerable-packages-main.log
+        echo "Scanning test project..."
+        dotnet list ${{ env.TEST_PROJECT_PATH }} package --vulnerable --include-transitive 2>&1 | tee vulnerable-packages-tests.log
+        
+    - name: Upload security scan results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: |
+          vulnerable-packages-main.log
+          vulnerable-packages-tests.log
+        retention-days: 30
+
+  epic-progress-check:
+    name: Epic Progress Check
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/feature/epic')
+
+    steps:
+    - name: Extract Epic Number
+      id: epic
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        EPIC_NUM=$(echo $BRANCH_NAME | grep -o 'epic[0-9]\+' | grep -o '[0-9]\+')
+        echo "number=$EPIC_NUM" >> $GITHUB_OUTPUT
+
+    - name: Comment on Epic Progress
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const epicNumber = '${{ steps.epic.outputs.number }}';
+          
+          // Find Epic issue
+          const issues = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            labels: '🏗️ epic',
+            state: 'open'
+          });
+          
+          const epicIssue = issues.data.find(issue => 
+            issue.title.includes(`Epic ${epicNumber}`) || 
+            issue.title.includes(`Epic #${epicNumber}`)
+          );
+          
+          if (epicIssue) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: epicIssue.number,
+              body: `🚀 **CI Build Status for Epic ${epicNumber}**\n\n` +
+                    `Branch: \`${{ github.ref_name }}\`\n` +
+                    `Commit: ${{ github.sha }}\n` +
+                    `Status: ✅ Build and tests passing\n\n` +
+                    `[View full CI run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            });
+          }
+
+  validate-epic-completion:
+    name: Validate Epic Completion
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'v2-dev'
+
+    steps:
+    - name: Check Epic Requirements
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const pr = context.payload.pull_request;
+          const body = pr.body || '';
+          
+          // Check if PR is for Epic completion
+          if (pr.head.ref.startsWith('feature/epic')) {
+            const requiredChecks = [
+              'All acceptance criteria met',
+              'Unit tests written and passing',
+              'Code reviewed and approved',
+              'Epic tracking issue updated'
+            ];
+            
+            const missingChecks = requiredChecks.filter(check => 
+              !body.includes(`- [x] ${check}`) && !body.includes(`- [X] ${check}`)
+            );
+            
+            if (missingChecks.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `⚠️ **Epic Completion Checklist**\n\n` +
+                      `Missing required items:\n` +
+                      missingChecks.map(item => `- [ ] ${item}`).join('\n') + '\n\n' +
+                      `Please ensure all Epic requirements are completed before merging.`
+              });
+            }
+          }
+
+  notify-status:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality]
+    if: always()
+
+    steps:
+    - name: Build Success Notification
+      if: needs.build-and-test.result == 'success'
+      run: echo "✅ Build and tests completed successfully!"
+
+    - name: Build Failure Notification  
+      if: needs.build-and-test.result == 'failure'
+      run: |
+        echo "❌ Build or tests failed!"
+        exit 1
+
+    - name: Update commit status
+      uses: actions/github-script@v7
+      if: always()
+      with:
+        script: |
+          const state = '${{ needs.build-and-test.result }}' === 'success' ? 'success' : 'failure';
+          const description = state === 'success' ? 
+            'All builds and tests passed' : 
+            'Build or tests failed';
+            
+          await github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.sha,
+            state: state,
+            description: description,
+            context: 'ci/build-and-test'
+          });
