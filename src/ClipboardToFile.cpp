@@ -398,7 +398,8 @@ void LoadSettings() {
             g_settings = defaults;
             CompileRegexPatterns();
         }
-        SaveSettings();
+        
+        SaveSettings(); // Save the new default file.
         return;
     }
 
