@@ -23,6 +23,9 @@
 #include <regex>        // For std::wregex
 #include "nlohmann/json.hpp"     // For nlohmann/json library via submodule
 #include "resource.h"
+#include <queue>
+#include <stack>
+#include <memory>
 
 
 //------------------------------------------------------------------------------------------------//
@@ -50,6 +53,8 @@
 #define ID_MENU_EDIT_CONFIG         1003
 #define ID_MENU_START_WITH_WINDOWS  1004
 #define ID_MENU_EXIT                1005
+#define ID_MENU_TOGGLE_DIRECTORY    1006
+#define ID_MENU_DIRECTORY_OPTIONS   1007
 
 const wchar_t CLASS_NAME[] = L"ClipboardToFileWindowClass";
 const wchar_t* REG_APP_KEY = L"Software\\ByronAP\\ClipboardToFile";
@@ -83,9 +88,12 @@ struct CompiledRegex {
 struct AppSettings {
     bool isCreateEmptyFileEnabled = true;
     bool isCreateWithContentEnabled = true;
+    bool isCreateDirectoryStructureEnabled = true;
     std::vector<std::wstring> allowedExtensions;
     std::vector<std::wstring> contentCreationRegexes;
     int heuristicWordCountLimit = 5;
+    bool createEmptyDirectories = true;
+    bool skipExistingDirectories = true;
 };
 AppSettings g_settings;
 
@@ -94,6 +102,23 @@ enum class FileConflictAction {
     Replace,
     Skip,
     Rename
+};
+
+struct TreeNode {
+    std::wstring name;
+    bool isDirectory;
+    std::wstring content;  // For enhanced format with file contents
+    std::vector<std::unique_ptr<TreeNode>> children;
+
+    TreeNode(const std::wstring& n, bool isDir = false) : name(n), isDirectory(isDir) {}
+};
+
+enum class TreeFormat {
+    Unknown,
+    TreeCommand,      // Uses ├── └── characters
+    Indentation,      // Uses spaces/tabs
+    PathList,         // Full paths like path/to/file.txt
+    Enhanced          // With file content markers
 };
 
 
@@ -125,6 +150,16 @@ bool CreateFileWithContentAtomic(const std::wstring&, const std::wstring&);
 bool CreateEmptyFileAtomic(const std::wstring&);
 bool IsValidFilename(const std::wstring&);
 std::vector<std::wstring> FindAdditionalFilenames(const std::wstring&, size_t);
+bool TryDirectoryStructureCreation(const std::wstring& clipboardText);
+TreeFormat DetectTreeFormat(const std::wstring& text);
+std::unique_ptr<TreeNode> ParseTreeStructure(const std::wstring& text, TreeFormat format);
+std::unique_ptr<TreeNode> ParseTreeCommandFormat(const std::vector<std::wstring>& lines);
+std::unique_ptr<TreeNode> ParseIndentationFormat(const std::vector<std::wstring>& lines);
+std::unique_ptr<TreeNode> ParsePathListFormat(const std::vector<std::wstring>& lines);
+std::unique_ptr<TreeNode> ParseEnhancedFormat(const std::vector<std::wstring>& lines);
+bool CreateDirectoryStructure(const TreeNode* root, const std::wstring& basePath);
+bool IsPathSafe(const std::wstring& path);
+void GetTreeSummary(const TreeNode* node, int& dirCount, int& fileCount);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -244,6 +279,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SaveSettings();
             break;
         }
+        case ID_MENU_TOGGLE_DIRECTORY: {
+            std::lock_guard<std::mutex> lock(g_extensionsMutex);
+            g_settings.isCreateDirectoryStructureEnabled = !g_settings.isCreateDirectoryStructureEnabled;
+            SaveSettings();
+            break;
+        }
         case ID_MENU_START_WITH_WINDOWS:
             SetStartup(!IsStartupEnabled());
             break;
@@ -319,9 +360,14 @@ void SaveSettings() {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
         j["createEmptyFileEnabled"] = g_settings.isCreateEmptyFileEnabled;
         j["createWithContentEnabled"] = g_settings.isCreateWithContentEnabled;
+        j["createDirectoryStructureEnabled"] = g_settings.isCreateDirectoryStructureEnabled;
+        j["createEmptyDirectories"] = g_settings.createEmptyDirectories;
+        j["skipExistingDirectories"] = g_settings.skipExistingDirectories;
+
         std::vector<std::string> utf8_allowedExtensions;
         for (const auto& wstr : g_settings.allowedExtensions) utf8_allowedExtensions.push_back(WstringToUtf8(wstr));
         j["allowedExtensions"] = utf8_allowedExtensions;
+
         std::vector<std::string> utf8_regexes;
         for (const auto& wstr : g_settings.contentCreationRegexes) utf8_regexes.push_back(WstringToUtf8(wstr));
         j["contentCreationRegexes"] = utf8_regexes;
@@ -341,6 +387,9 @@ void LoadSettings() {
         L"^file: (.*)$",
         L"^(.*\\.[a-zA-Z0-9]+)$"
     };
+    defaults.isCreateDirectoryStructureEnabled = true;
+    defaults.createEmptyDirectories = true;
+    defaults.skipExistingDirectories = true;
 
     std::ifstream f(settingsPath);
     if (!f.is_open()) {
@@ -359,16 +408,22 @@ void LoadSettings() {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
         g_settings.isCreateEmptyFileEnabled = j.value("createEmptyFileEnabled", defaults.isCreateEmptyFileEnabled);
         g_settings.isCreateWithContentEnabled = j.value("createWithContentEnabled", defaults.isCreateWithContentEnabled);
+        g_settings.isCreateDirectoryStructureEnabled = j.value("createDirectoryStructureEnabled", defaults.isCreateDirectoryStructureEnabled);
+        g_settings.createEmptyDirectories = j.value("createEmptyDirectories", defaults.createEmptyDirectories);
+        g_settings.skipExistingDirectories = j.value("skipExistingDirectories", defaults.skipExistingDirectories);
+
         if (j.contains("allowedExtensions")) {
             g_settings.allowedExtensions.clear();
             for (const auto& str : j["allowedExtensions"]) g_settings.allowedExtensions.push_back(Utf8ToWstring(str.get<std::string>()));
         }
         else { g_settings.allowedExtensions = defaults.allowedExtensions; }
+
         if (j.contains("contentCreationRegexes")) {
             g_settings.contentCreationRegexes.clear();
             for (const auto& str : j["contentCreationRegexes"]) g_settings.contentCreationRegexes.push_back(Utf8ToWstring(str.get<std::string>()));
         }
         else { g_settings.contentCreationRegexes = defaults.contentCreationRegexes; }
+
         g_settings.heuristicWordCountLimit = j.value("heuristicWordCountLimit", defaults.heuristicWordCountLimit);
         CompileRegexPatterns();
     }
@@ -617,6 +672,450 @@ int CountWords(const std::wstring& str) {
     int count = 0;
     while (ss >> word) count++;
     return count;
+}
+
+bool TryDirectoryStructureCreation(const std::wstring& clipboardText) {
+    bool enabled;
+    {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        enabled = g_settings.isCreateDirectoryStructureEnabled;
+    }
+
+    if (!enabled) return false;
+
+    // Detect format
+    TreeFormat format = DetectTreeFormat(clipboardText);
+    if (format == TreeFormat::Unknown) return false;
+
+    // Parse the structure
+    auto root = ParseTreeStructure(clipboardText, format);
+    if (!root) return false;
+
+    // Get Explorer path
+    std::wstring explorerPath = GetSingleExplorerPath();
+    if (explorerPath.empty()) {
+        ShowToastNotification(g_hMainWnd, L"Error", L"No File Explorer window found.", NIIF_ERROR);
+        return false;
+    }
+
+    // Count items for user confirmation
+    int dirCount = 0, fileCount = 0;
+    GetTreeSummary(root.get(), dirCount, fileCount);
+
+    // Show confirmation dialog for large structures
+    if (dirCount + fileCount > 10) {
+        std::wstring message = L"Create directory structure with:\n\n";
+        message += L"• " + std::to_wstring(dirCount) + L" directories\n";
+        message += L"• " + std::to_wstring(fileCount) + L" files\n\n";
+        message += L"Continue?";
+
+        if (MessageBoxW(NULL, message.c_str(), L"Confirm Directory Structure",
+            MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            return true; // User cancelled, but we handled the clipboard
+        }
+    }
+
+    // Create the structure
+    if (CreateDirectoryStructure(root.get(), explorerPath)) {
+        std::wstring msg = L"Created " + std::to_wstring(dirCount) + L" directories and " +
+            std::to_wstring(fileCount) + L" files";
+        ShowToastNotification(g_hMainWnd, L"Structure Created", msg, NIIF_INFO);
+        return true;
+    }
+    else {
+        ShowToastNotification(g_hMainWnd, L"Error", L"Failed to create directory structure", NIIF_ERROR);
+        return false;
+    }
+}
+
+TreeFormat DetectTreeFormat(const std::wstring& text) {
+    // Check for tree command characters (using Unicode code points)
+    // 0x251C = '├', 0x2514 = '└', 0x2502 = '│'
+    if (text.find(0x251C) != std::wstring::npos || text.find(0x2514) != std::wstring::npos ||
+        text.find(0x2502) != std::wstring::npos) {
+        return TreeFormat::TreeCommand;
+    }
+
+    // Check for enhanced format markers
+    if (text.find(L"---START:") != std::wstring::npos || text.find(L"---END:") != std::wstring::npos) {
+        return TreeFormat::Enhanced;
+    }
+
+    // Split into lines for further analysis
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        if (!line.empty()) lines.push_back(line);
+    }
+
+    if (lines.empty()) return TreeFormat::Unknown;
+
+    // Check for path list format (contains forward or back slashes)
+    bool hasSlashes = false;
+    for (const auto& l : lines) {
+        if (l.find(L'/') != std::wstring::npos || l.find(L'\\') != std::wstring::npos) {
+            hasSlashes = true;
+            break;
+        }
+    }
+
+    // Check for consistent indentation
+    bool hasIndentation = false;
+    for (const auto& l : lines) {
+        if (l[0] == L' ' || l[0] == L'\t') {
+            hasIndentation = true;
+            break;
+        }
+    }
+
+    if (hasSlashes && !hasIndentation) return TreeFormat::PathList;
+    if (hasIndentation) return TreeFormat::Indentation;
+
+    return TreeFormat::Unknown;
+}
+
+std::unique_ptr<TreeNode> ParseTreeStructure(const std::wstring& text, TreeFormat format) {
+    // Split into lines
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        lines.push_back(line);
+    }
+
+    switch (format) {
+    case TreeFormat::TreeCommand:
+        return ParseTreeCommandFormat(lines);
+    case TreeFormat::Indentation:
+        return ParseIndentationFormat(lines);
+    case TreeFormat::PathList:
+        return ParsePathListFormat(lines);
+    case TreeFormat::Enhanced:
+        return ParseEnhancedFormat(lines);
+    default:
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TreeNode> ParseTreeCommandFormat(const std::vector<std::wstring>& lines) {
+    auto root = std::make_unique<TreeNode>(L"root", true);
+    std::vector<TreeNode*> stack;
+    stack.push_back(root.get());
+
+    for (const auto& line : lines) {
+        if (line.empty()) continue;
+
+        // Count depth by tree characters
+        int depth = 0;
+        size_t pos = 0;
+        while (pos < line.length()) {
+            if (line[pos] == 0x2502 || line[pos] == L' ') {  // 0x2502 is '│'
+                depth++;
+                pos += 4; // Tree characters are usually followed by 3 spaces
+            }
+            else {
+                break;
+            }
+        }
+
+        // Find the actual content after tree characters
+        // 0x2502 = '│', 0x251C = '├', 0x2514 = '└', 0x2500 = '─'
+        std::wstring treeChars = L" \t";
+        treeChars += static_cast<wchar_t>(0x2502);  // │
+        treeChars += static_cast<wchar_t>(0x251C);  // ├
+        treeChars += static_cast<wchar_t>(0x2514);  // └
+        treeChars += static_cast<wchar_t>(0x2500);  // ─
+        size_t contentStart = line.find_first_not_of(treeChars, pos);
+        if (contentStart == std::wstring::npos) continue;
+
+        std::wstring name = line.substr(contentStart);
+        name.erase(0, name.find_first_not_of(L" \t"));
+        name.erase(name.find_last_not_of(L" \t\r") + 1);
+
+        if (name.empty()) continue;
+
+        // Check if it's a directory (ends with /)
+        bool isDir = name.back() == L'/';
+        if (isDir) name.pop_back();
+
+        // Adjust stack to current depth
+        while (stack.size() > depth + 1) stack.pop_back();
+
+        // Create node and add to parent
+        auto node = std::make_unique<TreeNode>(name, isDir);
+        TreeNode* nodePtr = node.get();
+        stack.back()->children.push_back(std::move(node));
+
+        if (isDir) stack.push_back(nodePtr);
+    }
+
+    return root;
+}
+
+std::unique_ptr<TreeNode> ParseIndentationFormat(const std::vector<std::wstring>& lines) {
+    auto root = std::make_unique<TreeNode>(L"root", true);
+    std::vector<std::pair<TreeNode*, int>> stack; // node, indent level
+    stack.push_back({ root.get(), -1 });
+
+    for (const auto& line : lines) {
+        if (line.empty()) continue;
+
+        // Count leading spaces/tabs
+        int indent = 0;
+        for (wchar_t c : line) {
+            if (c == L' ') indent++;
+            else if (c == L'\t') indent += 4; // treat tab as 4 spaces
+            else break;
+        }
+
+        // Extract name
+        std::wstring name = line.substr(indent);
+        name.erase(0, name.find_first_not_of(L" \t"));
+        name.erase(name.find_last_not_of(L" \t\r") + 1);
+
+        if (name.empty()) continue;
+
+        // Check if directory
+        bool isDir = name.back() == L'/';
+        if (isDir) name.pop_back();
+
+        // Find parent based on indentation
+        while (!stack.empty() && stack.back().second >= indent) {
+            stack.pop_back();
+        }
+
+        // Create node
+        auto node = std::make_unique<TreeNode>(name, isDir);
+        TreeNode* nodePtr = node.get();
+        stack.back().first->children.push_back(std::move(node));
+
+        if (isDir) stack.push_back({ nodePtr, indent });
+    }
+
+    return root;
+}
+
+std::unique_ptr<TreeNode> ParsePathListFormat(const std::vector<std::wstring>& lines) {
+    auto root = std::make_unique<TreeNode>(L"root", true);
+
+    for (const auto& line : lines) {
+        std::wstring path = line;
+        path.erase(0, path.find_first_not_of(L" \t"));
+        path.erase(path.find_last_not_of(L" \t\r") + 1);
+
+        if (path.empty()) continue;
+
+        // Normalize path separators
+        std::replace(path.begin(), path.end(), L'\\', L'/');
+
+        // Split path into components
+        std::vector<std::wstring> components;
+        std::wstringstream ss(path);
+        std::wstring component;
+        while (std::getline(ss, component, L'/')) {
+            if (!component.empty()) components.push_back(component);
+        }
+
+        if (components.empty()) continue;
+
+        // Navigate/create path in tree
+        TreeNode* current = root.get();
+        for (size_t i = 0; i < components.size(); ++i) {
+            const auto& comp = components[i];
+            bool isLastComponent = (i == components.size() - 1);
+            bool isDir = isLastComponent ? (path.back() == L'/') : true;
+
+            // Check for file extension in last component
+            if (isLastComponent && !isDir) {
+                size_t dotPos = comp.find_last_of(L'.');
+                if (dotPos != std::wstring::npos && dotPos > 0) {
+                    isDir = false;
+                }
+                else {
+                    isDir = true; // No extension, assume directory
+                }
+            }
+
+            // Find or create child
+            TreeNode* child = nullptr;
+            for (auto& c : current->children) {
+                if (c->name == comp) {
+                    child = c.get();
+                    break;
+                }
+            }
+
+            if (!child) {
+                auto newChild = std::make_unique<TreeNode>(comp, isDir);
+                child = newChild.get();
+                current->children.push_back(std::move(newChild));
+            }
+
+            if (isDir) current = child;
+        }
+    }
+
+    return root;
+}
+
+std::unique_ptr<TreeNode> ParseEnhancedFormat(const std::vector<std::wstring>& lines) {
+    auto root = ParseIndentationFormat(lines); // Start with basic indentation parsing
+
+    // Now look for content markers
+    std::wstring currentFile;
+    std::wstring currentContent;
+    bool inContent = false;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const auto& line = lines[i];
+
+        // Check for content start marker
+        if (line.find(L"---START:") != std::wstring::npos) {
+            size_t start = line.find(L"---START:") + 9;
+            size_t end = line.find(L"---", start);
+            if (end != std::wstring::npos) {
+                currentFile = line.substr(start, end - start);
+                currentFile.erase(0, currentFile.find_first_not_of(L" \t"));
+                currentFile.erase(currentFile.find_last_not_of(L" \t") + 1);
+                inContent = true;
+                currentContent.clear();
+            }
+        }
+        // Check for content end marker
+        else if (line.find(L"---END:") != std::wstring::npos && inContent) {
+            inContent = false;
+            // Find the file node and set its content
+            std::function<void(TreeNode*)> setContent = [&](TreeNode* node) {
+                if (!node->isDirectory && node->name == currentFile) {
+                    node->content = currentContent;
+                    return;
+                }
+                for (auto& child : node->children) {
+                    setContent(child.get());
+                }
+                };
+            setContent(root.get());
+        }
+        // Collect content
+        else if (inContent) {
+            if (!currentContent.empty()) currentContent += L"\n";
+            currentContent += line;
+        }
+    }
+
+    return root;
+}
+
+bool CreateDirectoryStructure(const TreeNode* root, const std::wstring& basePath) {
+    if (!root || root->children.empty()) return false;
+
+    bool skipExisting;
+    {
+        std::lock_guard<std::mutex> lock(g_extensionsMutex);
+        skipExisting = g_settings.skipExistingDirectories;
+    }
+
+    std::function<bool(const TreeNode*, const std::wstring&)> createNode =
+        [&](const TreeNode* node, const std::wstring& parentPath) -> bool {
+
+        std::wstring fullPath = parentPath + L"\\" + node->name;
+
+        // Security check
+        if (!IsPathSafe(fullPath)) {
+            ShowToastNotification(g_hMainWnd, L"Security Error",
+                L"Invalid path detected: " + node->name, NIIF_ERROR);
+            return false;
+        }
+
+        if (node->isDirectory) {
+            // Create directory
+            DWORD attrs = GetFileAttributesW(fullPath.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                if (!CreateDirectoryW(fullPath.c_str(), NULL)) {
+                    DWORD error = GetLastError();
+                    if (error != ERROR_ALREADY_EXISTS) {
+                        return false;
+                    }
+                }
+            }
+            else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                // File exists with same name
+                if (!skipExisting) {
+                    ShowToastNotification(g_hMainWnd, L"Error",
+                        L"File exists with directory name: " + node->name, NIIF_ERROR);
+                    return false;
+                }
+            }
+
+            // Create children
+            for (const auto& child : node->children) {
+                if (!createNode(child.get(), fullPath)) {
+                    return false;
+                }
+            }
+        }
+        else {
+            // Create file
+            bool createEmptyDirs;
+            {
+                std::lock_guard<std::mutex> lock(g_extensionsMutex);
+                createEmptyDirs = g_settings.createEmptyDirectories;
+            }
+
+            // Ensure parent directory exists
+            std::wstring parentDir = fullPath.substr(0, fullPath.find_last_of(L"\\"));
+            DWORD attrs = GetFileAttributesW(parentDir.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES && createEmptyDirs) {
+                // Create parent directories if needed
+                std::wstring currentPath;
+                std::wstringstream ss(parentDir);
+                std::wstring segment;
+                while (std::getline(ss, segment, L'\\')) {
+                    if (!currentPath.empty()) currentPath += L"\\";
+                    currentPath += segment;
+                    CreateDirectoryW(currentPath.c_str(), NULL);
+                }
+            }
+
+            // Create the file
+            if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                if (!node->content.empty()) {
+                    // Create with content
+                    std::wofstream file(fullPath);
+                    if (file.is_open()) {
+                        file << node->content;
+                        file.close();
+                    }
+                    else {
+                        return false;
+                    }
+                }
+                else {
+                    // Create empty file
+                    HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_WRITE, 0, NULL,
+                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        CloseHandle(hFile);
+                    }
+                    else {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+        };
+
+    // Create all children of root (skip the root node itself)
+    for (const auto& child : root->children) {
+        if (!createNode(child.get(), basePath)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // Unified function that handles both empty file generation and file generation with content
@@ -1084,7 +1583,12 @@ void ProcessClipboardChange()
     GlobalUnlock(hData);
     CloseClipboard();
 
-    // Single unified function handles all cases
+    // Try directory structure creation first
+    if (TryDirectoryStructureCreation(clipboardText)) {
+        return;
+    }
+
+    // Fall back to file generation
     TryFileGeneration(clipboardText);
 }
 
@@ -1176,16 +1680,24 @@ void ShowContextMenu(HWND hwnd)
     HMENU hMenu = CreatePopupMenu();
     if (hMenu) {
         std::lock_guard<std::mutex> lock(g_extensionsMutex);
+
         UINT emptyFlags = g_settings.isCreateEmptyFileEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
         InsertMenu(hMenu, 0, MF_BYPOSITION | emptyFlags, ID_MENU_TOGGLE_EMPTY, L"Create Empty File");
+
         UINT contentFlags = g_settings.isCreateWithContentEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
         InsertMenu(hMenu, 1, MF_BYPOSITION | contentFlags, ID_MENU_TOGGLE_CONTENT, L"Create File with Content");
-        InsertMenu(hMenu, 2, MF_SEPARATOR, 0, NULL);
+
+        UINT dirFlags = g_settings.isCreateDirectoryStructureEnabled ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
+        InsertMenu(hMenu, 2, MF_BYPOSITION | dirFlags, ID_MENU_TOGGLE_DIRECTORY, L"Create Directory Structure");
+
+        InsertMenu(hMenu, 3, MF_SEPARATOR, 0, NULL);
+
         UINT startupFlags = IsStartupEnabled() ? MF_STRING | MF_CHECKED : MF_STRING | MF_UNCHECKED;
-        InsertMenu(hMenu, 3, MF_BYPOSITION | startupFlags, ID_MENU_START_WITH_WINDOWS, L"Start with Windows");
-        InsertMenu(hMenu, 4, MF_BYPOSITION | MF_STRING, ID_MENU_EDIT_CONFIG, L"Edit Config...");
-        InsertMenu(hMenu, 5, MF_SEPARATOR, 0, NULL);
-        InsertMenu(hMenu, 6, MF_BYPOSITION | MF_STRING, ID_MENU_EXIT, L"Exit");
+        InsertMenu(hMenu, 4, MF_BYPOSITION | startupFlags, ID_MENU_START_WITH_WINDOWS, L"Start with Windows");
+        InsertMenu(hMenu, 5, MF_BYPOSITION | MF_STRING, ID_MENU_EDIT_CONFIG, L"Edit Config...");
+        InsertMenu(hMenu, 6, MF_SEPARATOR, 0, NULL);
+        InsertMenu(hMenu, 7, MF_BYPOSITION | MF_STRING, ID_MENU_EXIT, L"Exit");
+
         SetForegroundWindow(hwnd);
         TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
         DestroyMenu(hMenu);
@@ -1243,8 +1755,40 @@ void SetStartup(bool enable)
 }
 
 //------------------------------------------------------------------------------------------------//
-//                          FILE SECURITY & PATH VALIDATION                                       //
+//                          FILE/DIRECTORY SECURITY & PATH VALIDATION                             //
 //------------------------------------------------------------------------------------------------//
+
+bool IsPathSafe(const std::wstring& path) {
+    // Check for path traversal
+    if (path.find(L"..\\") != std::wstring::npos || path.find(L"../") != std::wstring::npos) {
+        return false;
+    }
+
+    // Check for absolute paths
+    if (path.length() >= 2 && path[1] == L':') return false;
+    if (path[0] == L'\\' || path[0] == L'/') return false;
+
+    // Check for UNC paths
+    if (path.length() >= 2 && path[0] == L'\\' && path[1] == L'\\') return false;
+
+    return true;
+}
+
+void GetTreeSummary(const TreeNode* node, int& dirCount, int& fileCount) {
+    if (!node) return;
+
+    if (node->isDirectory && node->name != L"root") {
+        dirCount++;
+    }
+    else if (!node->isDirectory) {
+        fileCount++;
+    }
+
+    for (const auto& child : node->children) {
+        GetTreeSummary(child.get(), dirCount, fileCount);
+    }
+}
+
 // Comprehensive filename validation to prevent security issues and filesystem errors
 bool IsValidFilename(const std::wstring& filename)
 {
