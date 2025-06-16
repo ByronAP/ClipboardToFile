@@ -1,0 +1,56 @@
+// Microsoft Visual C++ generated resource script.
+//
+#include "resource.h"
+#include "winver.h"
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+IDI_CLIPBOARDTOFILE     ICON                    "ClipboardToFile.ico"
+IDI_SMALL               ICON                    "small.ico"
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Version Information
+//
+
+VS_VERSION_INFO VERSIONINFO
+ // The version numbers here are placeholders. The release pipeline will
+ // stamp the executable with the correct version during the build process.
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "ByronAP"
+            VALUE "FileDescription", "Clipboard To File Utility"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "ClipboardToFile.exe"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "ClipboardToFile.exe"
+            VALUE "ProductName", "Clipboard To File"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        // Associates the string block with a language and character set.
+        VALUE "Translation", 0x409, 1200
+    END
+END
