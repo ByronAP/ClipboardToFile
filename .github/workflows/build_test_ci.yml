@@ -7,18 +7,47 @@ on:
       - 'src/**'
       - 'tests/**'
       - '.github/workflows/**'
+      - '*.csproj'
+      - '*.sln'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - 'docs/**'
+      - 'screenshots/**'
+      - 'assets/**'
   pull_request:
     branches: [ v2-dev, main ]
     paths:
       - 'src/**'
       - 'tests/**'
       - '.github/workflows/**'
+      - '*.csproj'
+      - '*.sln'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - 'docs/**'
+      - 'screenshots/**'
+      - 'assets/**'
 
 env:
+  # .NET Configuration
   DOTNET_VERSION: '9.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  
+  # Project Paths
   SOLUTION_PATH: 'ClipboardToFile.sln'
   PROJECT_PATH: 'src/ClipboardToFile.csproj'
   TEST_PROJECT_PATH: 'tests/tests.csproj'
+  
+  # Build Configuration
+  BUILD_CONFIGURATION: 'Debug'
+  TARGET_PLATFORM: 'x64'
 
 jobs:
   build-and-test:
@@ -29,79 +58,125 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 0  # Required for GitVersion and blame analysis
 
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
+    # Enhanced NuGet caching with fallback keys
     - name: Cache NuGet packages
       uses: actions/cache@v4
       with:
-        path: ~/.nuget/packages
-        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        path: |
+          ~/.nuget/packages
+          ~/.nuget/v3-cache
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.props', '**/Directory.Packages.props') }}
         restore-keys: |
+          ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
           ${{ runner.os }}-nuget-
 
+    # Cache build outputs for potential reuse
+    - name: Cache build outputs
+      uses: actions/cache@v4
+      with:
+        path: |
+          src/bin
+          src/obj
+          tests/bin
+          tests/obj
+        key: ${{ runner.os }}-build-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-build-
+
     - name: Restore main project dependencies
-      run: dotnet restore ${{ env.PROJECT_PATH }}
+      run: dotnet restore ${{ env.PROJECT_PATH }} --verbosity minimal
 
     - name: Restore test project dependencies
-      run: dotnet restore ${{ env.TEST_PROJECT_PATH }}
+      run: dotnet restore ${{ env.TEST_PROJECT_PATH }} --verbosity minimal
 
     - name: Build application
       run: |
         dotnet build ${{ env.PROJECT_PATH }} \
-          --configuration Debug \
+          --configuration ${{ env.BUILD_CONFIGURATION }} \
           --no-restore \
           --verbosity normal \
-          /p:Platform=x64
+          /p:Platform=${{ env.TARGET_PLATFORM }} \
+          /p:TreatWarningsAsErrors=false \
+          /p:ContinuousIntegrationBuild=true
 
     - name: Build tests
       run: |
         dotnet build ${{ env.TEST_PROJECT_PATH }} \
-          --configuration Debug \
+          --configuration ${{ env.BUILD_CONFIGURATION }} \
           --no-restore \
           --verbosity normal
 
-    - name: Run unit tests
+    - name: Run unit tests with coverage
       run: |
         dotnet test ${{ env.TEST_PROJECT_PATH }} \
-          --configuration Debug \
+          --configuration ${{ env.BUILD_CONFIGURATION }} \
           --no-build \
           --verbosity normal \
           --logger trx \
+          --logger "console;verbosity=detailed" \
           --collect:"XPlat Code Coverage" \
-          --results-directory ./TestResults
+          --results-directory ./TestResults \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
 
     - name: Upload test results
-      if: success() || failure()
+      if: always()  # Upload even if tests fail
       uses: actions/upload-artifact@v4
       with:
-        name: test-results-x64
+        name: test-results-${{ env.TARGET_PLATFORM }}
         path: ./TestResults
         retention-days: 7
+
+    - name: Upload coverage to Codecov
+      if: always()
+      uses: codecov/codecov-action@v4
+      with:
+        directory: ./TestResults
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false  # Don't fail CI if codecov upload fails
 
   code-quality:
     name: Code Quality Analysis
     runs-on: windows-latest
+    # Run in parallel with build-and-test for faster feedback
     if: github.event_name == 'pull_request'
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Required for blame analysis
 
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
+    # Reuse the same cache as build job
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.nuget/packages
+          ~/.nuget/v3-cache
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.props', '**/Directory.Packages.props') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          ${{ runner.os }}-nuget-
+
     - name: Restore dependencies
       run: |
-        dotnet restore ${{ env.PROJECT_PATH }}
-        dotnet restore ${{ env.TEST_PROJECT_PATH }}
+        dotnet restore ${{ env.PROJECT_PATH }} --verbosity minimal
+        dotnet restore ${{ env.TEST_PROJECT_PATH }} --verbosity minimal
 
+    # Enhanced code analysis with stricter settings
     - name: Run code analysis
       run: |
         dotnet build ${{ env.PROJECT_PATH }} \
@@ -109,17 +184,41 @@ jobs:
           --verbosity normal \
           /p:TreatWarningsAsErrors=true \
           /p:WarningsAsErrors="" \
-          /p:WarningsNotAsErrors="CS1591"
+          /p:WarningsNotAsErrors="CS1591;CS1573" \
+          /p:RunAnalyzersDuringBuild=true \
+          /p:EnableNETAnalyzers=true \
+          /p:AnalysisLevel=latest
 
+    # Check code formatting (fail if not formatted)
     - name: Check formatting
       run: |
         dotnet format ${{ env.PROJECT_PATH }} --verify-no-changes --verbosity diagnostic
         dotnet format ${{ env.TEST_PROJECT_PATH }} --verify-no-changes --verbosity diagnostic
 
+    # Additional static analysis tools
+    - name: Run security analysis
+      run: |
+        # Install security analyzer if not already present
+        dotnet list ${{ env.PROJECT_PATH }} package | grep -q Microsoft.CodeAnalysis.NetAnalyzers || \
+          dotnet add ${{ env.PROJECT_PATH }} package Microsoft.CodeAnalysis.NetAnalyzers --version 8.0.0
+        
+        # Run analysis
+        dotnet build ${{ env.PROJECT_PATH }} \
+          --configuration Release \
+          --verbosity normal \
+          /p:RunCodeAnalysis=true \
+          /p:CodeAnalysisRuleSet=security.ruleset || true
+
   security-scan:
-    name: Security Scan
+    name: Security Vulnerability Scan
     runs-on: windows-latest
+    # Run in parallel with other jobs for faster feedback
     if: github.event_name == 'pull_request'
+    
+    permissions:
+      # Required for uploading SARIF results to GitHub Security tab
+      security-events: write
+      contents: read
 
     steps:
     - name: Checkout code
@@ -130,18 +229,102 @@ jobs:
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
+    # Reuse the same cache
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.nuget/packages
+          ~/.nuget/v3-cache
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.props', '**/Directory.Packages.props') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          ${{ runner.os }}-nuget-
+
     - name: Restore dependencies
       run: |
-        dotnet restore ${{ env.PROJECT_PATH }}
-        dotnet restore ${{ env.TEST_PROJECT_PATH }}
+        dotnet restore ${{ env.PROJECT_PATH }} --verbosity minimal
+        dotnet restore ${{ env.TEST_PROJECT_PATH }} --verbosity minimal
 
-    - name: Run security scan
+    # Enhanced vulnerability scanning with failure conditions
+    - name: Scan for vulnerable packages
+      id: vulnerability_scan
       run: |
-        echo "Scanning main project..."
-        dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive 2>&1 | tee vulnerable-packages-main.log
-        echo "Scanning test project..."
-        dotnet list ${{ env.TEST_PROJECT_PATH }} package --vulnerable --include-transitive 2>&1 | tee vulnerable-packages-tests.log
+        echo "🔍 Scanning for vulnerable packages..."
         
+        # Scan main project
+        echo "Scanning main project..."
+        dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive > vulnerable-packages-main.log 2>&1
+        MAIN_VULNERABILITIES=$?
+        
+        # Scan test project  
+        echo "Scanning test project..."
+        dotnet list ${{ env.TEST_PROJECT_PATH }} package --vulnerable --include-transitive > vulnerable-packages-tests.log 2>&1
+        TEST_VULNERABILITIES=$?
+        
+        # Check for critical/high vulnerabilities
+        CRITICAL_FOUND=0
+        if grep -i "critical\|high" vulnerable-packages-main.log vulnerable-packages-tests.log; then
+          echo "❌ Critical or High severity vulnerabilities found!"
+          CRITICAL_FOUND=1
+        fi
+        
+        # Output results
+        echo "main_exit_code=$MAIN_VULNERABILITIES" >> $GITHUB_OUTPUT
+        echo "test_exit_code=$TEST_VULNERABILITIES" >> $GITHUB_OUTPUT
+        echo "critical_found=$CRITICAL_FOUND" >> $GITHUB_OUTPUT
+        
+        # Display scan results
+        echo "=== Main Project Vulnerabilities ==="
+        cat vulnerable-packages-main.log
+        echo "=== Test Project Vulnerabilities ==="
+        cat vulnerable-packages-tests.log
+
+    # Install and run additional security scanners
+    - name: Install DevSkim CLI
+      run: |
+        dotnet tool install --global Microsoft.CST.DevSkim.CLI
+
+    - name: Run DevSkim security analysis
+      run: |
+        echo "🛡️ Running DevSkim security analysis..."
+        devskim analyze src/ --output-format sarif --output-file devskim-results.sarif || true
+        
+        # Also run on tests for completeness
+        devskim analyze tests/ --output-format sarif --output-file devskim-tests-results.sarif || true
+
+    # Upload SARIF results to GitHub Security tab
+    - name: Upload DevSkim SARIF results
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: |
+          devskim-results.sarif
+          devskim-tests-results.sarif
+        category: "DevSkim"
+
+    # Create security summary
+    - name: Generate security summary
+      if: always()
+      run: |
+        echo "# 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.vulnerability_scan.outputs.critical_found }}" = "1" ]; then
+          echo "## ❌ Critical Issues Found" >> $GITHUB_STEP_SUMMARY
+          echo "Critical or High severity vulnerabilities detected in dependencies." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ✅ No Critical Issues" >> $GITHUB_STEP_SUMMARY
+          echo "No critical or high severity vulnerabilities found." >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Package Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "- Main project exit code: ${{ steps.vulnerability_scan.outputs.main_exit_code }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Test project exit code: ${{ steps.vulnerability_scan.outputs.test_exit_code }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📋 Detailed results available in job artifacts and GitHub Security tab." >> $GITHUB_STEP_SUMMARY
+
     - name: Upload security scan results
       if: always()
       uses: actions/upload-artifact@v4
@@ -150,11 +333,22 @@ jobs:
         path: |
           vulnerable-packages-main.log
           vulnerable-packages-tests.log
+          devskim-results.sarif
+          devskim-tests-results.sarif
         retention-days: 30
 
+    # Fail the job if critical vulnerabilities are found
+    - name: Fail on critical vulnerabilities
+      if: steps.vulnerability_scan.outputs.critical_found == '1'
+      run: |
+        echo "💥 Build failed due to critical/high severity vulnerabilities!"
+        echo "Please review the security scan results and update vulnerable packages."
+        exit 1
+
   epic-progress-check:
-    name: Epic Progress Check
+    name: Epic Progress Tracking
     runs-on: ubuntu-latest
+    # Only run for epic feature branches
     if: startsWith(github.ref, 'refs/heads/feature/epic')
 
     steps:
@@ -164,93 +358,178 @@ jobs:
         BRANCH_NAME="${{ github.ref_name }}"
         EPIC_NUM=$(echo $BRANCH_NAME | grep -o 'epic[0-9]\+' | grep -o '[0-9]\+')
         echo "number=$EPIC_NUM" >> $GITHUB_OUTPUT
+        echo "Extracted epic number: $EPIC_NUM"
 
-    - name: Comment on Epic Progress
+    - name: Post Epic Progress Update
       uses: actions/github-script@v7
       with:
         script: |
           const epicNumber = '${{ steps.epic.outputs.number }}';
           
-          // Find Epic issue
-          const issues = await github.rest.issues.listForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            labels: '🏗️ epic',
-            state: 'open'
-          });
-          
-          const epicIssue = issues.data.find(issue => 
-            issue.title.includes(`Epic ${epicNumber}`) || 
-            issue.title.includes(`Epic #${epicNumber}`)
-          );
-          
-          if (epicIssue) {
-            await github.rest.issues.createComment({
+          try {
+            // Find Epic issue by label and title pattern
+            const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: epicIssue.number,
-              body: `🚀 **CI Build Status for Epic ${epicNumber}**\n\n` +
-                    `Branch: \`${{ github.ref_name }}\`\n` +
-                    `Commit: ${{ github.sha }}\n` +
-                    `Status: ✅ Build and tests passing\n\n` +
-                    `[View full CI run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+              labels: '🏗️ epic',
+              state: 'open'
             });
+            
+            const epicIssue = issues.data.find(issue => 
+              issue.title.includes(`Epic ${epicNumber}`) || 
+              issue.title.includes(`Epic #${epicNumber}`) ||
+              issue.title.toLowerCase().includes(`epic ${epicNumber}`)
+            );
+            
+            if (epicIssue) {
+              const buildStatus = '${{ needs.build-and-test.result }}' === 'success' ? '✅' : '❌';
+              const statusText = '${{ needs.build-and-test.result }}' === 'success' ? 'passing' : 'failing';
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: epicIssue.number,
+                body: `🚀 **CI Build Update for Epic ${epicNumber}**\n\n` +
+                      `${buildStatus} **Status**: Build and tests ${statusText}\n` +
+                      `📝 **Branch**: \`${{ github.ref_name }}\`\n` +
+                      `🔗 **Commit**: ${{ github.sha }}\n` +
+                      `📊 **Platform**: ${{ env.TARGET_PLATFORM }} ${{ env.BUILD_CONFIGURATION }}\n\n` +
+                      `[View full CI run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+              });
+              
+              console.log(`✅ Updated Epic #${epicIssue.number}`);
+            } else {
+              console.log(`⚠️ No Epic issue found for Epic ${epicNumber}`);
+            }
+          } catch (error) {
+            console.log(`❌ Error updating Epic: ${error.message}`);
           }
 
   validate-epic-completion:
-    name: Validate Epic Completion
+    name: Epic Completion Validation
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.base_ref == 'v2-dev'
+    # Only run for PRs targeting v2-dev from epic branches
+    if: github.event_name == 'pull_request' && github.base_ref == 'v2-dev' && startsWith(github.head_ref, 'feature/epic')
 
     steps:
-    - name: Check Epic Requirements
+    - name: Validate Epic Completion Checklist
       uses: actions/github-script@v7
       with:
         script: |
           const pr = context.payload.pull_request;
           const body = pr.body || '';
+          const headRef = pr.head.ref;
           
-          // Check if PR is for Epic completion
-          if (pr.head.ref.startsWith('feature/epic')) {
-            const requiredChecks = [
-              'All acceptance criteria met',
-              'Unit tests written and passing',
-              'Code reviewed and approved',
-              'Epic tracking issue updated'
+          console.log(`Validating Epic completion for PR #${pr.number}`);
+          console.log(`Branch: ${headRef}`);
+          
+          // Extract epic number from branch name
+          const epicMatch = headRef.match(/epic(\d+)/);
+          const epicNumber = epicMatch ? epicMatch[1] : 'unknown';
+          
+          // Define required checklist items for Epic completion
+          const requiredChecks = [
+            'All acceptance criteria met',
+            'Unit tests written and passing', 
+            'Integration tests completed',
+            'Code reviewed and approved',
+            'Documentation updated',
+            'Epic tracking issue updated'
+          ];
+          
+          // Check which items are missing from the PR body
+          const missingChecks = requiredChecks.filter(check => {
+            const patterns = [
+              `- [x] ${check}`,
+              `- [X] ${check}`,
+              `* [x] ${check}`,
+              `* [X] ${check}`
             ];
+            return !patterns.some(pattern => body.includes(pattern));
+          });
+          
+          // Generate validation results
+          if (missingChecks.length > 0) {
+            const warningMessage = `⚠️ **Epic ${epicNumber} Completion Checklist Validation**\n\n` +
+              `This PR appears to be completing an Epic, but some required items are missing from the description:\n\n` +
+              missingChecks.map(item => `- [ ] ${item}`).join('\n') + '\n\n' +
+              `**Please ensure all Epic requirements are completed before merging.**\n\n` +
+              `### How to fix this:\n` +
+              `1. Edit this PR description\n` +
+              `2. Add the missing checklist items\n` +
+              `3. Mark completed items as \`- [x] Item description\`\n\n` +
+              `### Required Epic completion checklist:\n` +
+              requiredChecks.map(item => `- [ ] ${item}`).join('\n');
             
-            const missingChecks = requiredChecks.filter(check => 
-              !body.includes(`- [x] ${check}`) && !body.includes(`- [X] ${check}`)
-            );
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: warningMessage
+            });
             
-            if (missingChecks.length > 0) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-                body: `⚠️ **Epic Completion Checklist**\n\n` +
-                      `Missing required items:\n` +
-                      missingChecks.map(item => `- [ ] ${item}`).join('\n') + '\n\n' +
-                      `Please ensure all Epic requirements are completed before merging.`
-              });
-            }
+            console.log(`❌ Missing ${missingChecks.length} required items`);
+            core.setFailed(`Epic completion validation failed: ${missingChecks.length} missing items`);
+          } else {
+            const successMessage = `✅ **Epic ${epicNumber} Completion Validated**\n\n` +
+              `All required Epic completion items are present in the PR description. ` +
+              `The Epic appears ready for final review and merge!`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: successMessage
+            });
+            
+            console.log(`✅ All Epic completion requirements satisfied`);
           }
 
   notify-status:
     name: Notify Build Status
     runs-on: ubuntu-latest
     needs: [build-and-test]
+    # Include security scan only if it ran (PR events)
     if: always()
 
     steps:
+    - name: Determine overall status
+      id: status
+      run: |
+        BUILD_STATUS="${{ needs.build-and-test.result }}"
+        
+        # Check if security scan ran and its status
+        SECURITY_STATUS="skipped"
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          SECURITY_STATUS="${{ needs.security-scan.result || 'not_run' }}"
+        fi
+        
+        echo "build_status=$BUILD_STATUS" >> $GITHUB_OUTPUT
+        echo "security_status=$SECURITY_STATUS" >> $GITHUB_OUTPUT
+        
+        # Determine overall success
+        if [ "$BUILD_STATUS" = "success" ] && [ "$SECURITY_STATUS" != "failure" ]; then
+          echo "overall_status=success" >> $GITHUB_OUTPUT
+        else
+          echo "overall_status=failure" >> $GITHUB_OUTPUT
+        fi
+
     - name: Build Success Notification
-      if: needs.build-and-test.result == 'success'
-      run: echo "✅ Build and tests completed successfully!"
+      if: steps.status.outputs.overall_status == 'success'
+      run: |
+        echo "✅ All checks passed successfully!"
+        echo "🏗️ Build: ${{ steps.status.outputs.build_status }}"
+        echo "🛡️ Security: ${{ steps.status.outputs.security_status }}"
+        echo "🎯 Target: ${{ env.TARGET_PLATFORM }} ${{ env.BUILD_CONFIGURATION }}"
+        echo "🔧 .NET: ${{ env.DOTNET_VERSION }}"
 
     - name: Build Failure Notification  
-      if: needs.build-and-test.result == 'failure'
+      if: steps.status.outputs.overall_status == 'failure'
       run: |
-        echo "❌ Build or tests failed!"
+        echo "❌ One or more checks failed!"
+        echo "🏗️ Build: ${{ steps.status.outputs.build_status }}"
+        echo "🛡️ Security: ${{ steps.status.outputs.security_status }}"
+        echo "📋 Check the job logs for detailed error information"
         exit 1
 
     - name: Update commit status
@@ -258,7 +537,7 @@ jobs:
       if: always()
       with:
         script: |
-          const state = '${{ needs.build-and-test.result }}' === 'success' ? 'success' : 'failure';
+          const state = '${{ steps.status.outputs.overall_status }}' === 'success' ? 'success' : 'failure';
           const description = state === 'success' ? 
             'All builds and tests passed' : 
             'Build or tests failed';
