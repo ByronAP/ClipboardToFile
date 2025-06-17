@@ -11,12 +11,6 @@ on:
       - '*.sln'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.txt'
-      - 'docs/**'
-      - 'screenshots/**'
-      - 'assets/**'
   pull_request:
     branches: [ v2-dev, main ]
     paths:
@@ -27,13 +21,7 @@ on:
       - '*.sln'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.txt'
-      - 'docs/**'
-      - 'screenshots/**'
-      - 'assets/**'
-
+     
 env:
   # .NET Configuration
   DOTNET_VERSION: '9.0.x'
