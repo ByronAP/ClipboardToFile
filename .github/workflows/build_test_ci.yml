@@ -338,42 +338,9 @@ jobs:
         Write-Host "=== Test Project Vulnerabilities ==="
         Get-Content vulnerable-packages-tests.log
 
-    # Install and run additional security scanners
-    - name: Install DevSkim CLI
-      run: |
-        dotnet tool install --global Microsoft.CST.DevSkim.CLI
-
-    - name: Run DevSkim security analysis
-      run: |
-        Write-Host "🛡️ Running DevSkim security analysis..."
-        
-        # Analyze source code
-        devskim analyze -I src/ -f sarif -O devskim-results.sarif
-        if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim analysis completed with warnings" }
-        
-        # Analyze tests (only if tests directory exists)
-        if (Test-Path "tests/") {
-          devskim analyze -I tests/ -f sarif -O devskim-tests-results.sarif
-          if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim test analysis completed with warnings" }
-        } else {
-          Write-Host "Tests directory not found, skipping test analysis"
-          # Create empty SARIF file to avoid upload issues
-          '{"version":"2.1.0","$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json","runs":[]}' | Out-File -FilePath "devskim-tests-results.sarif" -Encoding UTF8
-        }
-        
-        # Verify files were created
-        Write-Host "=== Generated SARIF Files ==="
-        if (Test-Path "devskim-results.sarif") {
-          Write-Host "✅ devskim-results.sarif created ($(Get-Item devskim-results.sarif | Select-Object -ExpandProperty Length) bytes)"
-        } else {
-          Write-Host "❌ devskim-results.sarif not found"
-        }
-        
-        if (Test-Path "devskim-tests-results.sarif") {
-          Write-Host "✅ devskim-tests-results.sarif created ($(Get-Item devskim-tests-results.sarif | Select-Object -ExpandProperty Length) bytes)"
-        } else {
-          Write-Host "❌ devskim-tests-results.sarif not found"
-        }
+    # Install and run DevSkim security scanner
+    - name: Run DevSkim scanner
+      uses: microsoft/DevSkim-Action@v1
 
     # Upload SARIF results to GitHub Security tab
     - name: Upload DevSkim SARIF results
@@ -381,15 +348,7 @@ jobs:
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: devskim-results.sarif
-        category: "DevSkim-Source"
-      continue-on-error: true  # Don't fail if SARIF upload has issues
-
-    - name: Upload DevSkim Test SARIF results
-      if: always()
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: devskim-tests-results.sarif
-        category: "DevSkim-Tests"
+        category: "DevSkim"
       continue-on-error: true  # Don't fail if SARIF upload has issues
 
     # Create security summary
@@ -423,7 +382,6 @@ jobs:
           vulnerable-packages-main.log
           vulnerable-packages-tests.log
           devskim-results.sarif
-          devskim-tests-results.sarif
         retention-days: 30
         if-no-files-found: warn  # Warn instead of error if some files missing
 

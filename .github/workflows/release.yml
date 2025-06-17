@@ -117,18 +117,29 @@ jobs:
     - name: Install security analysis tools
       run: |
         Write-Host "📦 Installing security analysis tools..."
-        dotnet tool install --global Microsoft.CST.DevSkim.CLI --verbosity minimal
 
-    - name: Run static security analysis
+    - name: Run DevSkim scanner
+      uses: microsoft/DevSkim-Action@v1
+
+    - name: Upload DevSkim SARIF results
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: devskim-results.sarif
+        category: "DevSkim-Release"
+      continue-on-error: true  # Don't fail if SARIF upload has issues
+
+    - name: Review security analysis results
       run: |
-        Write-Host "🛡️ Running DevSkim static analysis..."
-        devskim analyze src/ --output-format json --output-file security-analysis.json
-        if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim analysis completed with warnings" }
+        Write-Host "🛡️ DevSkim security analysis completed"
         
-        # Check for any high/critical issues in static analysis
-        if (Test-Path security-analysis.json) {
-          Write-Host "Static analysis completed, checking results..."
-          Get-Content security-analysis.json
+        # Check if SARIF file was created and show basic info
+        if (Test-Path "devskim-results.sarif") {
+          Write-Host "✅ DevSkim SARIF report generated and uploaded to Security tab"
+          $fileSize = (Get-Item "devskim-results.sarif").Length
+          Write-Host "📄 Report size: $fileSize bytes"
+        } else {
+          Write-Host "⚠️ No DevSkim SARIF report found"
         }
 
     - name: Security assessment
@@ -154,8 +165,9 @@ jobs:
         name: security-scan-reports
         path: |
           vulnerability-report.log
-          security-analysis.json
+          devskim-results.sarif
         retention-days: 90  # Keep security reports longer
+        if-no-files-found: warn
 
   version-and-tag:
     name: Generate Version and Tag
