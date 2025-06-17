@@ -233,6 +233,7 @@ jobs:
         dotnet restore ${{ env.TEST_PROJECT_PATH }} --verbosity minimal
 
     # Enhanced code analysis with stricter settings
+    # Note: Disable publish-specific optimizations to avoid NETSDK1102 errors in CI
     - name: Run code analysis
       run: |
         dotnet build ${{ env.PROJECT_PATH }} `
@@ -241,7 +242,10 @@ jobs:
           /p:TreatWarningsAsErrors=false `
           /p:RunAnalyzersDuringBuild=true `
           /p:EnableNETAnalyzers=true `
-          /p:AnalysisLevel=latest
+          /p:AnalysisLevel=latest `
+          /p:PublishTrimmed=false `
+          /p:PublishSingleFile=false `
+          /p:SelfContained=false
         
         Write-Host "✅ Code analysis completed"
 
@@ -261,12 +265,15 @@ jobs:
           dotnet add ${{ env.PROJECT_PATH }} package Microsoft.CodeAnalysis.NetAnalyzers --version 8.0.0
         }
         
-        # Run analysis
+        # Run analysis - disable publish-specific optimizations for CI builds
         dotnet build ${{ env.PROJECT_PATH }} `
           --configuration Release `
           --verbosity normal `
           /p:RunCodeAnalysis=true `
-          /p:CodeAnalysisRuleSet=security.ruleset
+          /p:CodeAnalysisRuleSet=security.ruleset `
+          /p:PublishTrimmed=false `
+          /p:PublishSingleFile=false `
+          /p:SelfContained=false
         
         if ($LASTEXITCODE -ne 0) { 
           Write-Host "Security analysis completed with warnings/errors"
