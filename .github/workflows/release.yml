@@ -10,11 +10,7 @@ on:
       - '*.sln'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'screenshots/**'
-      - 'assets/**'
+
   workflow_dispatch:
     inputs:
       release_type:
