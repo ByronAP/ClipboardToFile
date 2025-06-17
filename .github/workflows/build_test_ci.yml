@@ -105,22 +105,24 @@ jobs:
       run: |
         # Create simple runsettings for coverage if it doesn't exist
         if (-not (Test-Path "coverlet.runsettings")) {
-          $runsettings = @'
-<?xml version="1.0" encoding="utf-8" ?>
-<RunSettings>
-  <DataCollectionRunSettings>
-    <DataCollectors>
-      <DataCollector friendlyName="XPlat code coverage">
-        <Configuration>
-          <Format>cobertura,opencover</Format>
-          <Exclude>[*Tests*]*,[*Test*]*</Exclude>
-        </Configuration>
-      </DataCollector>
-    </DataCollectors>
-  </DataCollectionRunSettings>
-</RunSettings>
-'@
-          $runsettings | Out-File -FilePath "coverlet.runsettings" -Encoding UTF8
+          Write-Host "Creating coverlet.runsettings file..."
+          
+          # Create XML content as string
+          $xmlContent = '<?xml version="1.0" encoding="utf-8" ?>'
+          $xmlContent += "`n<RunSettings>"
+          $xmlContent += "`n  <DataCollectionRunSettings>"
+          $xmlContent += "`n    <DataCollectors>"
+          $xmlContent += "`n      <DataCollector friendlyName=`"XPlat code coverage`">"
+          $xmlContent += "`n        <Configuration>"
+          $xmlContent += "`n          <Format>cobertura,opencover</Format>"
+          $xmlContent += "`n          <Exclude>[*Tests*]*,[*Test*]*</Exclude>"
+          $xmlContent += "`n        </Configuration>"
+          $xmlContent += "`n      </DataCollector>"
+          $xmlContent += "`n    </DataCollectors>"
+          $xmlContent += "`n  </DataCollectionRunSettings>"
+          $xmlContent += "`n</RunSettings>"
+          
+          $xmlContent | Out-File -FilePath "coverlet.runsettings" -Encoding UTF8
         }
         
         dotnet test ${{ env.TEST_PROJECT_PATH }} `
