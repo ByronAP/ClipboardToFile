@@ -431,58 +431,47 @@ jobs:
         Write-Host "📋 Creating enhanced portable package..."
         
         # Create comprehensive README for portable version
-        $readmeContent = @"
-# ClipboardToFile v$version - Portable Edition
-
-This is the portable version of ClipboardToFile that requires no installation.
-
-## 🚀 Quick Start
-1. Extract this ZIP file to any folder
-2. Run ClipboardToFile.exe
-3. The application will run from this folder with all settings stored locally
-
-## 📋 What's Included
-- ClipboardToFile.exe (Main application)
-- All required .NET runtime files (self-contained)
-- Configuration files and dependencies
-- This README file
-
-## 💻 System Requirements
-- Windows 10 version 1809 (October 2018 Update) or later
-- x64 architecture (64-bit Windows)
-- No additional runtime installation required
-
-## 🔒 Security Information
-- All executables are digitally signed (if certificate available)
-- No registry modifications required
-- Runs entirely from the extraction folder
-- Settings stored in local application data
-
-## 🆔 Release Information
-- **Version**: $version
-- **Platform**: $platform
-- **Build Date**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
-- **Security Scan**: ${{ needs.version-and-tag.outputs.security_passed }}
-
-## 🔗 Support & Links
-- **GitHub Repository**: https://github.com/ByronAP/ClipboardToFile
-- **Issues & Support**: https://github.com/ByronAP/ClipboardToFile/issues
-- **Latest Releases**: https://github.com/ByronAP/ClipboardToFile/releases
-
-## 📜 License
-See LICENSE file or repository for full license information.
-"@
+        $readmeContent = "# ClipboardToFile v$version - Portable Edition`n`n"
+        $readmeContent += "This is the portable version of ClipboardToFile that requires no installation.`n`n"
+        $readmeContent += "## 🚀 Quick Start`n"
+        $readmeContent += "1. Extract this ZIP file to any folder`n"
+        $readmeContent += "2. Run ClipboardToFile.exe`n"
+        $readmeContent += "3. The application will run from this folder with all settings stored locally`n`n"
+        $readmeContent += "## 📋 What's Included`n"
+        $readmeContent += "- ClipboardToFile.exe (Main application)`n"
+        $readmeContent += "- All required .NET runtime files (self-contained)`n"
+        $readmeContent += "- Configuration files and dependencies`n"
+        $readmeContent += "- This README file`n`n"
+        $readmeContent += "## 💻 System Requirements`n"
+        $readmeContent += "- Windows 10 version 1809 (October 2018 Update) or later`n"
+        $readmeContent += "- x64 architecture (64-bit Windows)`n"
+        $readmeContent += "- No additional runtime installation required`n`n"
+        $readmeContent += "## 🔒 Security Information`n"
+        $readmeContent += "- All executables are digitally signed (if certificate available)`n"
+        $readmeContent += "- No registry modifications required`n"
+        $readmeContent += "- Runs entirely from the extraction folder`n"
+        $readmeContent += "- Settings stored in local application data`n`n"
+        $readmeContent += "## 🆔 Release Information`n"
+        $readmeContent += "- **Version**: $version`n"
+        $readmeContent += "- **Platform**: $platform`n"
+        $readmeContent += "- **Build Date**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')`n"
+        $readmeContent += "- **Security Scan**: ${{ needs.version-and-tag.outputs.security_passed }}`n`n"
+        $readmeContent += "## 🔗 Support & Links`n"
+        $readmeContent += "- **GitHub Repository**: https://github.com/ByronAP/ClipboardToFile`n"
+        $readmeContent += "- **Issues & Support**: https://github.com/ByronAP/ClipboardToFile/issues`n"
+        $readmeContent += "- **Latest Releases**: https://github.com/ByronAP/ClipboardToFile/releases`n`n"
+        $readmeContent += "## 📜 License`n"
+        $readmeContent += "See LICENSE file or repository for full license information.`n"
         
         $readmeContent | Out-File -FilePath "$portableDir\README.txt" -Encoding UTF8
         
         # Create version info file
-        $versionInfo = @"
-ClipboardToFile Portable v$version
-Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
-Platform: $platform
-Runtime: ${{ env.TARGET_RUNTIME }}
-Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
-"@
+        $versionInfo = "ClipboardToFile Portable v$version`n"
+        $versionInfo += "Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')`n"
+        $versionInfo += "Platform: $platform`n"
+        $versionInfo += "Runtime: ${{ env.TARGET_RUNTIME }}`n"
+        $versionInfo += "Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}`n"
+        
         $versionInfo | Out-File -FilePath "$portableDir\VERSION.txt" -Encoding UTF8
         
         # Create the archive
