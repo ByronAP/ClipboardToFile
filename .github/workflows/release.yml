@@ -114,12 +114,24 @@ jobs:
         Write-Host "=== Security Scan Results ==="
         Get-Content vulnerability-report.log
 
+    # Install and run DevSkim security scanner
+    # Note: We use the CLI instead of microsoft/DevSkim-Action@v1 because 
+    # container actions only work on Linux, but we need Windows for .NET builds
     - name: Install security analysis tools
       run: |
         Write-Host "📦 Installing security analysis tools..."
+        dotnet tool install --global Microsoft.CST.DevSkim.CLI --verbosity minimal
 
-    - name: Run DevSkim scanner
-      uses: microsoft/DevSkim-Action@v1
+    - name: Run DevSkim security analysis
+      run: |
+        Write-Host "🛡️ Running DevSkim security analysis..."
+        devskim analyze -I src/ -f sarif -O devskim-results.sarif
+        
+        if (Test-Path "devskim-results.sarif") {
+          Write-Host "✅ DevSkim SARIF report generated for release"
+        } else {
+          Write-Host "⚠️ No DevSkim SARIF report found"
+        }
 
     - name: Upload DevSkim SARIF results
       if: always()
@@ -128,19 +140,6 @@ jobs:
         sarif_file: devskim-results.sarif
         category: "DevSkim-Release"
       continue-on-error: true  # Don't fail if SARIF upload has issues
-
-    - name: Review security analysis results
-      run: |
-        Write-Host "🛡️ DevSkim security analysis completed"
-        
-        # Check if SARIF file was created and show basic info
-        if (Test-Path "devskim-results.sarif") {
-          Write-Host "✅ DevSkim SARIF report generated and uploaded to Security tab"
-          $fileSize = (Get-Item "devskim-results.sarif").Length
-          Write-Host "📄 Report size: $fileSize bytes"
-        } else {
-          Write-Host "⚠️ No DevSkim SARIF report found"
-        }
 
     - name: Security assessment
       id: security_check
