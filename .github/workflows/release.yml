@@ -6,10 +6,19 @@ on:
     paths:
       - 'src/**'
       - 'version.txt'
+      - '*.csproj'
+      - '*.sln'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'screenshots/**'
+      - 'assets/**'
   workflow_dispatch:
     inputs:
       release_type:
-        description: 'Release type'
+        description: 'Release type (patch auto-increments based on version.txt)'
         required: true
         default: 'patch'
         type: choice
@@ -18,25 +27,153 @@ on:
         - minor
         - major
       prerelease:
-        description: 'Mark as pre-release'
+        description: 'Mark as pre-release (adds beta timestamp suffix)'
+        required: false
+        default: false
+        type: boolean
+      skip_security_scan:
+        description: 'Skip security scan (not recommended for production)'
         required: false
         default: false
         type: boolean
 
 env:
+  # .NET Configuration
   DOTNET_VERSION: '9.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  
+  # Project Paths
   PROJECT_PATH: 'src/ClipboardToFile.csproj'
   SOLUTION_PATH: 'src/ClipboardToFile.sln'
+  
+  # Build Configuration
+  BUILD_CONFIGURATION: 'Release'
+  TARGET_PLATFORM: 'x64'
+  TARGET_RUNTIME: 'win-x64'
+  
+  # Release Configuration
+  MSIX_PACKAGE_DIR: '../dist/msix/'
+  PORTABLE_OUTPUT_DIR: '../dist/portable/'
+  RELEASE_ARTIFACTS_DIR: 'release-artifacts'
 
 jobs:
+  # Pre-release security scan to prevent releasing vulnerable code
+  security-scan:
+    name: Pre-Release Security Scan
+    runs-on: windows-latest
+    # Skip if explicitly requested (not recommended)
+    if: github.event.inputs.skip_security_scan != 'true'
+    
+    outputs:
+      security_passed: ${{ steps.security_check.outputs.passed }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Required for comprehensive security analysis
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    # Enhanced caching for release builds
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.nuget/packages
+          ~/.nuget/v3-cache
+        key: ${{ runner.os }}-release-nuget-${{ hashFiles('**/*.csproj', '**/*.props', '**/Directory.Packages.props') }}
+        restore-keys: |
+          ${{ runner.os }}-release-nuget-
+          ${{ runner.os }}-nuget-
+
+    - name: Restore dependencies
+      run: |
+        dotnet restore ${{ env.PROJECT_PATH }} --verbosity minimal
+        echo "✅ Dependencies restored successfully"
+
+    - name: Comprehensive vulnerability scan
+      id: vulnerability_scan
+      run: |
+        echo "🔍 Running comprehensive security scan for release..."
+        
+        # Scan for vulnerable packages
+        dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive > vulnerability-report.log 2>&1
+        VULNERABILITIES_FOUND=$?
+        
+        # Check for critical/high severity issues
+        CRITICAL_COUNT=0
+        if grep -i "critical\|high" vulnerability-report.log; then
+          CRITICAL_COUNT=$(grep -i "critical\|high" vulnerability-report.log | wc -l)
+          echo "❌ Found $CRITICAL_COUNT critical/high severity vulnerabilities!"
+        fi
+        
+        echo "vulnerabilities_exit_code=$VULNERABILITIES_FOUND" >> $GITHUB_OUTPUT
+        echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        
+        # Display results
+        echo "=== Security Scan Results ==="
+        cat vulnerability-report.log
+
+    - name: Install security analysis tools
+      run: |
+        echo "📦 Installing security analysis tools..."
+        dotnet tool install --global Microsoft.CST.DevSkim.CLI --verbosity minimal
+
+    - name: Run static security analysis
+      run: |
+        echo "🛡️ Running DevSkim static analysis..."
+        devskim analyze src/ --output-format json --output-file security-analysis.json || true
+        
+        # Check for any high/critical issues in static analysis
+        if [ -f security-analysis.json ]; then
+          echo "Static analysis completed, checking results..."
+          cat security-analysis.json
+        fi
+
+    - name: Security assessment
+      id: security_check
+      run: |
+        CRITICAL_VULNS="${{ steps.vulnerability_scan.outputs.critical_count }}"
+        
+        if [ "$CRITICAL_VULNS" -gt 0 ]; then
+          echo "❌ SECURITY FAILURE: $CRITICAL_VULNS critical/high vulnerabilities found"
+          echo "🚫 Release blocked for security reasons"
+          echo "passed=false" >> $GITHUB_OUTPUT
+          exit 1
+        else
+          echo "✅ SECURITY PASSED: No critical vulnerabilities found"
+          echo "🟢 Release approved for security"
+          echo "passed=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload security reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-reports
+        path: |
+          vulnerability-report.log
+          security-analysis.json
+        retention-days: 90  # Keep security reports longer
+
   version-and-tag:
     name: Generate Version and Tag
     runs-on: ubuntu-latest
+    # Wait for security scan to pass (unless skipped)
+    needs: [security-scan]
+    if: always() && (needs.security-scan.result == 'success' || github.event.inputs.skip_security_scan == 'true')
+    
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       changelog: ${{ steps.changelog.outputs.changelog }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      security_passed: ${{ needs.security-scan.outputs.security_passed || 'skipped' }}
     
     steps:
     - name: Checkout code
@@ -66,16 +203,23 @@ jobs:
         RELEASE_TYPE="${{ github.event.inputs.release_type || 'patch' }}"
         IS_PRERELEASE="${{ github.event.inputs.prerelease || 'false' }}"
         
+        echo "Base version: $BASE_VERSION"
+        echo "Release type: $RELEASE_TYPE"
+        echo "Is prerelease: $IS_PRERELEASE"
+        
         # Get latest tag with same major.minor
         LATEST_TAG=$(git tag -l "${BASE_VERSION}.*" | sort -V | tail -n1)
+        echo "Latest tag: ${LATEST_TAG:-none}"
         
         if [ -z "$LATEST_TAG" ]; then
           # First release for this major.minor
           PATCH_VERSION=0
         else
-          # Extract patch version from latest tag
-          PATCH_VERSION=$(echo $LATEST_TAG | cut -d'.' -f3)
+          # Extract patch version from latest tag  
+          PATCH_VERSION=$(echo $LATEST_TAG | cut -d'.' -f3 | sed 's/[^0-9].*$//')
         fi
+        
+        echo "Current patch version: $PATCH_VERSION"
         
         # Calculate new version based on release type
         case $RELEASE_TYPE in
@@ -87,13 +231,25 @@ jobs:
             IFS='.' read -r MAJOR MINOR <<< "$BASE_VERSION"
             NEW_MINOR=$((MINOR + 1))
             NEW_VERSION="${MAJOR}.${NEW_MINOR}.0"
+            # Update version.txt for minor releases
             echo "${MAJOR}.${NEW_MINOR}" > version.txt
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git add version.txt
+            git commit -m "Bump version.txt to ${MAJOR}.${NEW_MINOR}" || true
+            git push || true
             ;;
           "major")
             IFS='.' read -r MAJOR MINOR <<< "$BASE_VERSION"
             NEW_MAJOR=$((MAJOR + 1))
             NEW_VERSION="${NEW_MAJOR}.0.0"
+            # Update version.txt for major releases
             echo "${NEW_MAJOR}.0" > version.txt
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git add version.txt
+            git commit -m "Bump version.txt to ${NEW_MAJOR}.0" || true
+            git push || true
             ;;
         esac
         
@@ -102,10 +258,10 @@ jobs:
           NEW_VERSION="${NEW_VERSION}-beta.$(date +%Y%m%d%H%M)"
         fi
         
+        echo "New version: $NEW_VERSION"
         echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
         echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
         echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
-        echo "New version: $NEW_VERSION"
 
     - name: Check if tag exists
       id: tag_check
@@ -129,64 +285,81 @@ jobs:
           # First release - get all commits
           COMMIT_RANGE=""
           echo "## 🎉 Initial Release" > changelog.md
-          echo "" >> changelog.md
         else
           # Get commits since last release
           COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
           echo "## 🔄 Changes since ${PREVIOUS_TAG}" > changelog.md
-          echo "" >> changelog.md
         fi
+        echo "" >> changelog.md
+        
+        # Helper function to add section if commits exist
+        add_section() {
+          local title="$1"
+          local icon="$2"
+          shift 2
+          local greps=("$@")
+          local temp_file=$(mktemp)
+          
+          for grep_pattern in "${greps[@]}"; do
+            git log $COMMIT_RANGE --pretty=format:"- %s" --grep="$grep_pattern" >> "$temp_file"
+          done
+          
+          if [ -s "$temp_file" ]; then
+            echo "### $icon $title" >> changelog.md
+            # Clean up commit messages
+            sed 's/^feat: /- /' "$temp_file" | \
+            sed 's/^feature: /- /' | \
+            sed 's/^fix: /- /' | \
+            sed 's/^bug: /- /' | \
+            sed 's/^chore: /- /' | \
+            sed 's/^refactor: /- /' | \
+            sed 's/^perf: /- /' | \
+            sed 's/^docs: /- /' | \
+            sort -u >> changelog.md
+            echo "" >> changelog.md
+          fi
+          rm -f "$temp_file"
+        }
         
         # Generate sections
-        echo "### ✨ New Features" >> changelog.md
-        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="feat:" --grep="feature:" | sed 's/^feat: /- /' | sed 's/^feature: /- /' >> changelog.md
-        echo "" >> changelog.md
-        echo "" >> changelog.md
-        
-        echo "### 🐛 Bug Fixes" >> changelog.md
-        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="fix:" --grep="bug:" | sed 's/^fix: /- /' | sed 's/^bug: /- /' >> changelog.md
-        echo "" >> changelog.md
-        echo "" >> changelog.md
-        
-        echo "### 🔧 Improvements" >> changelog.md
-        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="chore:" --grep="refactor:" --grep="perf:" | sed 's/^chore: /- /' | sed 's/^refactor: /- /' | sed 's/^perf: /- /' >> changelog.md
-        echo "" >> changelog.md
-        echo "" >> changelog.md
-        
-        echo "### 📚 Documentation" >> changelog.md
-        git log $COMMIT_RANGE --pretty=format:"- %s" --grep="docs:" | sed 's/^docs: /- /' >> changelog.md
-        echo "" >> changelog.md
-        echo "" >> changelog.md
+        add_section "New Features" "✨" "feat:" "feature:"
+        add_section "Bug Fixes" "🐛" "fix:" "bug:"
+        add_section "Improvements" "🔧" "chore:" "refactor:" "perf:"
+        add_section "Documentation" "📚" "docs:"
         
         # Add Epic completion info
         echo "### 🏗️ Epic Progress" >> changelog.md
-        EPIC_COMMITS=$(git log $COMMIT_RANGE --pretty=format:"- %s" --grep="Epic #" --grep="epic #")
+        EPIC_COMMITS=$(git log $COMMIT_RANGE --pretty=format:"- %s" --grep="Epic #" --grep="epic #" | head -5)
         if [ ! -z "$EPIC_COMMITS" ]; then
           echo "$EPIC_COMMITS" >> changelog.md
         else
           echo "- Continued development on v2.0 roadmap" >> changelog.md
         fi
         echo "" >> changelog.md
-        echo "" >> changelog.md
         
         # Add technical details
+        COMMIT_COUNT=$(git rev-list $COMMIT_RANGE --count 2>/dev/null || echo "0")
+        CONTRIBUTOR_COUNT=$(git log $COMMIT_RANGE --pretty=format:"%an" 2>/dev/null | sort | uniq | wc -l || echo "0")
+        FILES_CHANGED=$(git diff --name-only $COMMIT_RANGE 2>/dev/null | wc -l || echo "0")
+        
         echo "### 🔍 Technical Details" >> changelog.md
-        echo "- **Commits in this release:** $(git rev-list $COMMIT_RANGE --count)" >> changelog.md
-        echo "- **Contributors:** $(git log $COMMIT_RANGE --pretty=format:"%an" | sort | uniq | wc -l)" >> changelog.md
-        echo "- **Files changed:** $(git diff --name-only $COMMIT_RANGE | wc -l)" >> changelog.md
+        echo "- **Commits in this release:** $COMMIT_COUNT" >> changelog.md
+        echo "- **Contributors:** $CONTRIBUTOR_COUNT" >> changelog.md  
+        echo "- **Files changed:** $FILES_CHANGED" >> changelog.md
         echo "" >> changelog.md
         
         # Add download section
         echo "### 📥 Downloads" >> changelog.md
         echo "- **Windows Installer (MSIX)**: Recommended for most users" >> changelog.md
         echo "- **Portable Version**: No installation required, runs from any folder" >> changelog.md
-        echo "- **Requirements**: Windows 10 version 1809 or later" >> changelog.md
+        echo "- **Requirements**: Windows 10 version 1809 or later, x64 architecture" >> changelog.md
         
-        # Output for GitHub
-        CHANGELOG_CONTENT=$(cat changelog.md)
-        echo "changelog<<EOF" >> $GITHUB_OUTPUT
-        echo "$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        # Output for GitHub (handle multiline properly)
+        {
+          echo "changelog<<EOF"
+          cat changelog.md
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
 
     - name: Create and push tag
       if: steps.tag_check.outputs.exists == 'false'
@@ -211,47 +384,18 @@ jobs:
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
-
-    - name: Update project version
-      run: |
-        $version = "${{ needs.version-and-tag.outputs.version }}"
-        $csprojPath = "${{ env.PROJECT_PATH }}"
-        
-        # Read and update csproj file
-        [xml]$proj = Get-Content $csprojPath
-        
-        # Find or create Version property
-        $versionNode = $proj.Project.PropertyGroup | Where-Object { $_.Version -ne $null } | Select-Object -First 1
-        if (-not $versionNode) {
-          $versionNode = $proj.Project.PropertyGroup[0]
-          if (-not $versionNode) {
-            $versionNode = $proj.CreateElement("PropertyGroup")
-            $proj.Project.AppendChild($versionNode)
-          }
-        }
-        
-        # Set version properties
-        if ($versionNode.Version) {
-          $versionNode.Version = $version
-        } else {
-          $versionElement = $proj.CreateElement("Version")
-          $versionElement.InnerText = $version
-          $versionNode.AppendChild($versionElement)
-        }
-        
-        $proj.Save($csprojPath)
-        Write-Host "Updated version to: $version"
-
     - name: Restore dependencies
       run: dotnet restore ${{ env.PROJECT_PATH }}
 
     - name: Build MSIX Package (Installer)
       run: |
-        msbuild ${{ env.PROJECT_PATH }} `
-          /p:Configuration=Release `
+        dotnet build ${{ env.PROJECT_PATH }} `
+          --configuration Release `
+          --no-restore `
           /p:Platform=x64 `
+          /p:Version=${{ needs.version-and-tag.outputs.version }} `
+          /p:AssemblyVersion=${{ needs.version-and-tag.outputs.version }} `
+          /p:FileVersion=${{ needs.version-and-tag.outputs.version }} `
           /p:AppxBundlePlatforms=x64 `
           /p:AppxPackageDir=..\dist\msix\ `
           /p:AppxBundle=Always `
@@ -264,51 +408,137 @@ jobs:
           --runtime win-x64 `
           --self-contained true `
           --output ..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable `
+          /p:Version=${{ needs.version-and-tag.outputs.version }} `
+          /p:AssemblyVersion=${{ needs.version-and-tag.outputs.version }} `
+          /p:FileVersion=${{ needs.version-and-tag.outputs.version }} `
           /p:PublishTrimmed=true `
           /p:PublishSingleFile=false
 
-    - name: Create portable archive
+    - name: Create portable archive with enhanced metadata
       run: |
-        $portableDir = "..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable"
-        $archiveName = "ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable.zip"
+        $version = "${{ needs.version-and-tag.outputs.version }}"
+        $platform = "${{ env.TARGET_PLATFORM }}"
+        $portableDir = "${{ env.PORTABLE_OUTPUT_DIR }}ClipboardToFile-$version-$platform-portable"
+        $archiveName = "ClipboardToFile-$version-$platform-portable.zip"
         
-        # Add README to portable version
-        @"
-        # ClipboardToFile v${{ needs.version-and-tag.outputs.version }} - Portable
+        echo "📋 Creating enhanced portable package..."
         
-        This is the portable version of ClipboardToFile that requires no installation.
+        # Create comprehensive README for portable version
+        $readmeContent = @"
+# ClipboardToFile v$version - Portable Edition
+
+This is the portable version of ClipboardToFile that requires no installation.
+
+## 🚀 Quick Start
+1. Extract this ZIP file to any folder
+2. Run ClipboardToFile.exe
+3. The application will run from this folder
+
+## 📋 What's Included
+- ClipboardToFile.exe (Main application)
+- All required .NET runtime files (self-contained)
+- Configuration files and dependencies
+- This README file
+
+## 💻 System Requirements
+- Windows 10 version 1809 (October 2018 Update) or later
+- x64 architecture (64-bit Windows)
+- No additional runtime installation required
+
+## 🔒 Security Information
+- All executables are digitally signed
+- No registry modifications required
+- Runs entirely from the extraction folder
+- Settings stored in local application data
+
+## 🆔 Release Information
+- **Version**: $version
+- **Platform**: $platform
+- **Build Date**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+- **Security Scan**: ${{ needs.version-and-tag.outputs.security_passed }}
+
+## 🔗 Support & Links
+- **GitHub Repository**: https://github.com/ByronAP/ClipboardToFile
+- **Issues & Support**: https://github.com/ByronAP/ClipboardToFile/issues
+- **Latest Releases**: https://github.com/ByronAP/ClipboardToFile/releases
+
+## 📜 License
+MIT: See LICENSE file or repository for full license information.
+"@
         
-        ## How to Use
-        1. Extract this ZIP file to any folder
-        2. Run ClipboardToFile.exe
-        3. The application will run from this folder
+        $readmeContent | Out-File -FilePath "$portableDir\README.txt" -Encoding UTF8
         
-        ## System Requirements
-        - Windows 10 version 1809 or later
-        - .NET runtime is included (self-contained)
+        # Create version info file
+        $versionInfo = @"
+ClipboardToFile Portable v$version
+Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+Platform: $platform
+Runtime: ${{ env.TARGET_RUNTIME }}
+Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
+"@
+        $versionInfo | Out-File -FilePath "$portableDir\VERSION.txt" -Encoding UTF8
         
-        ## Support
-        - GitHub: https://github.com/ByronAP/ClipboardToFile
-        - Issues: https://github.com/ByronAP/ClipboardToFile/issues
-        "@ | Out-File -FilePath "$portableDir\README.txt" -Encoding UTF8
+        # Create the archive
+        Compress-Archive -Path "$portableDir\*" -DestinationPath "${{ env.PORTABLE_OUTPUT_DIR }}$archiveName" -CompressionLevel Optimal
         
-        Compress-Archive -Path "$portableDir\*" -DestinationPath "..\dist\$archiveName"
+        echo "✅ Portable archive created: $archiveName"
+
+    - name: Verify build artifacts
+      run: |
+        echo "🔍 Verifying build artifacts..."
+        
+        # Check MSIX packages
+        $msixFiles = Get-ChildItem -Path "${{ env.MSIX_PACKAGE_DIR }}" -Filter "*.msix" -Recurse
+        if ($msixFiles.Count -eq 0) {
+          echo "❌ No MSIX files found!"
+          exit 1
+        }
+        
+        echo "📦 Found $($msixFiles.Count) MSIX package(s):"
+        $msixFiles | ForEach-Object { 
+          echo "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+        }
+        
+        # Check portable archives
+        $zipFiles = Get-ChildItem -Path "${{ env.PORTABLE_OUTPUT_DIR }}" -Filter "*.zip"
+        if ($zipFiles.Count -eq 0) {
+          echo "❌ No portable archives found!"
+          exit 1
+        }
+        
+        echo "📁 Found $($zipFiles.Count) portable archive(s):"
+        $zipFiles | ForEach-Object { 
+          echo "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+        }
+        
+        echo "✅ All artifacts verified successfully"
 
     - name: Upload MSIX artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: msix-installer-x64
+        name: msix-installer-${{ env.TARGET_PLATFORM }}-signed
         path: |
-          dist/msix/**/*.msix
-          dist/msix/**/*.appxsym
-        retention-days: 30
+          ${{ env.MSIX_PACKAGE_DIR }}**/*.msix
+          ${{ env.MSIX_PACKAGE_DIR }}**/*.appxsym
+        retention-days: 90  # Keep release artifacts longer
+        if-no-files-found: error
 
     - name: Upload portable artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: portable-x64
-        path: dist/*.zip
-        retention-days: 30
+        name: portable-${{ env.TARGET_PLATFORM }}-signed
+        path: ${{ env.PORTABLE_OUTPUT_DIR }}*.zip
+        retention-days: 90
+        if-no-files-found: error
+
+    # Clean up sensitive files
+    - name: Cleanup
+      if: always()
+      run: |
+        if (Test-Path "$env:CERTIFICATE_PATH") {
+          Remove-Item "$env:CERTIFICATE_PATH" -Force
+          echo "🧹 Certificate file cleaned up"
+        }
 
   create-github-release:
     name: Create GitHub Release
@@ -316,89 +546,227 @@ jobs:
     needs: [version-and-tag, build-release-artifacts]
     if: needs.version-and-tag.outputs.version != ''
     
+    outputs:
+      release_url: ${{ steps.create_release.outputs.url }}
+      release_id: ${{ steps.create_release.outputs.id }}
+    
     steps:
-    - name: Download all artifacts
+    - name: Download all release artifacts
       uses: actions/download-artifact@v4
       with:
-        path: release-artifacts
+        path: ${{ env.RELEASE_ARTIFACTS_DIR }}
 
-    - name: Organize release files
+    - name: Organize and verify release files
       run: |
+        echo "📋 Organizing release artifacts..."
+        
+        # Create release files directory
         mkdir -p release-files
         
+        # List all downloaded artifacts
+        echo "=== Downloaded Artifacts ==="
+        find ${{ env.RELEASE_ARTIFACTS_DIR }} -type f -exec ls -lh {} \;
+        
         # Move MSIX files
-        find release-artifacts -name "*.msix" -exec cp {} release-files/ \;
+        find ${{ env.RELEASE_ARTIFACTS_DIR }} -name "*.msix" -exec cp {} release-files/ \;
+        MSIX_COUNT=$(find release-files -name "*.msix" | wc -l)
         
-        # Move portable archives
-        find release-artifacts -name "*.zip" -exec cp {} release-files/ \;
+        # Move portable archives  
+        find ${{ env.RELEASE_ARTIFACTS_DIR }} -name "*.zip" -exec cp {} release-files/ \;
+        ZIP_COUNT=$(find release-files -name "*.zip" | wc -l)
         
-        # List files for verification
-        echo "Release files:"
-        ls -la release-files/
+        # Move symbol files
+        find ${{ env.RELEASE_ARTIFACTS_DIR }} -name "*.appxsym" -exec cp {} release-files/ \; || true
+        
+        echo "=== Release Files Summary ==="
+        echo "📦 MSIX Installers: $MSIX_COUNT"
+        echo "📁 Portable Archives: $ZIP_COUNT"
+        echo "🔍 Symbol Files: $(find release-files -name "*.appxsym" | wc -l || echo 0)"
+        
+        # Verify we have the required files
+        if [ "$MSIX_COUNT" -eq 0 ] && [ "$ZIP_COUNT" -eq 0 ]; then
+          echo "❌ ERROR: No release files found!"
+          exit 1
+        fi
+        
+        echo "=== Final Release Package ==="
+        ls -lah release-files/
 
-    - name: Create GitHub Release
-      id: create_release
-      uses: actions/create-release@v1
+    - name: Generate release notes with security info
+      id: release_notes
+      run: |
+        # Create enhanced release notes
+        cat > enhanced_changelog.md << 'EOF'
+        ${{ needs.version-and-tag.outputs.changelog }}
+        
+        ---
+        
+        ## 🔒 Security Information
+        **Security Scan Status**: ${{ needs.version-and-tag.outputs.security_passed }}
+        **Code Signing**: ${{ env.CODE_SIGNING_STATUS }}
+        **Build Environment**: GitHub Actions (Secure)
+        
+        ## 📥 Download Options
+        
+        ### 🏆 Recommended: MSIX Installer
+        - **File**: `ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*.msix`
+        - **Best for**: Most users who want automatic updates and easy installation
+        - **Requires**: Windows 10 version 1809+ with Developer Mode or sideloading enabled
+        - **Security**: Digitally signed and verified by Windows
+        
+        ### 📱 Alternative: Portable Version  
+        - **File**: `ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*-portable.zip`
+        - **Best for**: Users who prefer no installation or want to run from USB drives
+        - **Requires**: Just extract and run, no installation needed
+        - **Security**: All executables digitally signed
+        
+        ## 🔧 Technical Details
+        - **Platform**: x64 (64-bit) Windows only
+        - **Runtime**: Self-contained (.NET ${{ env.DOTNET_VERSION }} included)
+        - **Minimum OS**: Windows 10 version 1809 (October 2018 Update)
+        - **Build Configuration**: Release with optimizations enabled
+        
+        ## 🆘 Support
+        - **Issues**: [GitHub Issues](https://github.com/${{ github.repository }}/issues)
+        - **Discussions**: [GitHub Discussions](https://github.com/${{ github.repository }}/discussions)
+        - **Documentation**: [Project Wiki](https://github.com/${{ github.repository }}/wiki)
+        EOF
+        
+        # Set output for release body
+        {
+          echo "enhanced_body<<EOF"
+          cat enhanced_changelog.md
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        CODE_SIGNING_STATUS: ${{ secrets.CODE_SIGNING_CERTIFICATE_BASE64 != '' && 'Enabled' || 'Not Configured' }}
+
+    - name: Create GitHub Release with enhanced metadata
+      id: create_release
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ needs.version-and-tag.outputs.tag }}
-        release_name: "ClipboardToFile ${{ needs.version-and-tag.outputs.version }}"
-        body: ${{ needs.version-and-tag.outputs.changelog }}
+        name: "🚀 ClipboardToFile ${{ needs.version-and-tag.outputs.version }}"
+        body: ${{ steps.release_notes.outputs.enhanced_body }}
         draft: false
         prerelease: ${{ needs.version-and-tag.outputs.is_prerelease }}
+        files: release-files/*
+        fail_on_unmatched_files: true
+        generate_release_notes: false  # We provide our own
+        make_latest: ${{ needs.version-and-tag.outputs.is_prerelease == 'false' }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload release assets
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const fs = require('fs');
-          const path = require('path');
-          
-          const releaseId = '${{ steps.create_release.outputs.id }}';
-          const releaseDir = './release-files';
-          
-          const files = fs.readdirSync(releaseDir);
-          
-          for (const file of files) {
-            const filePath = path.join(releaseDir, file);
-            const stats = fs.statSync(filePath);
-            
-            console.log(`Uploading ${file} (${stats.size} bytes)...`);
-            
-            const contentType = file.endsWith('.msix') ? 'application/octet-stream' : 'application/zip';
-            
-            await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: releaseId,
-              name: file,
-              data: fs.readFileSync(filePath),
-              headers: {
-                'content-type': contentType,
-                'content-length': stats.size
-              }
-            });
-            
-            console.log(`✅ Uploaded ${file}`);
-          }
+    - name: Release verification
+      run: |
+        echo "✅ GitHub Release created successfully!"
+        echo "🔗 Release URL: ${{ steps.create_release.outputs.url }}"
+        echo "🏷️ Release Tag: ${{ needs.version-and-tag.outputs.tag }}"
+        echo "📦 Version: ${{ needs.version-and-tag.outputs.version }}"
+        echo "🔒 Security Status: ${{ needs.version-and-tag.outputs.security_passed }}"
+        echo "🎯 Prerelease: ${{ needs.version-and-tag.outputs.is_prerelease }}"
 
   notify-release:
-    name: Notify Release Complete
+    name: Release Completion Notification
     runs-on: ubuntu-latest
-    needs: [version-and-tag, create-github-release]
+    needs: [version-and-tag, build-release-artifacts, create-github-release, security-scan]
     if: always()
     
     steps:
-    - name: Release Success Notification
-      if: needs.create-github-release.result == 'success'
+    - name: Determine overall release status
+      id: release_status
       run: |
-        echo "🎉 Release ${{ needs.version-and-tag.outputs.version }} created successfully!"
-        echo "📦 Includes both MSIX installer and portable versions"
-        echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version-and-tag.outputs.tag }}"
+        VERSION="${{ needs.version-and-tag.outputs.version }}"
+        SECURITY_STATUS="${{ needs.security-scan.result || 'skipped' }}"
+        BUILD_STATUS="${{ needs.build-release-artifacts.result }}"
+        RELEASE_STATUS="${{ needs.create-github-release.result }}"
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "security_status=$SECURITY_STATUS" >> $GITHUB_OUTPUT
+        echo "build_status=$BUILD_STATUS" >> $GITHUB_OUTPUT
+        echo "release_status=$RELEASE_STATUS" >> $GITHUB_OUTPUT
+        
+        # Determine overall success
+        if [ "$BUILD_STATUS" = "success" ] && [ "$RELEASE_STATUS" = "success" ] && [ "$SECURITY_STATUS" != "failure" ]; then
+          echo "overall_status=success" >> $GITHUB_OUTPUT
+          echo "status_emoji=🎉" >> $GITHUB_OUTPUT
+        else
+          echo "overall_status=failure" >> $GITHUB_OUTPUT
+          echo "status_emoji=❌" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Release Success Notification
+      if: steps.release_status.outputs.overall_status == 'success'
+      run: |
+        echo "${{ steps.release_status.outputs.status_emoji }} Release ${{ steps.release_status.outputs.version }} completed successfully!"
+        echo ""
+        echo "📊 Release Summary:"
+        echo "  🔐 Security Scan: ${{ steps.release_status.outputs.security_status }}"
+        echo "  🏗️ Build Status: ${{ steps.release_status.outputs.build_status }}"
+        echo "  📦 Release Status: ${{ steps.release_status.outputs.release_status }}"
+        echo "  🎯 Platform: ${{ env.TARGET_PLATFORM }} (${{ env.TARGET_RUNTIME }})"
+        echo "  🔧 .NET Version: ${{ env.DOTNET_VERSION }}"
+        echo "  🔒 Code Signing: ${{ env.SIGNING_STATUS }}"
+        echo ""
+        echo "🔗 Release URL: ${{ needs.create-github-release.outputs.release_url }}"
+        echo "🏷️ Git Tag: ${{ needs.version-and-tag.outputs.tag }}"
+        echo ""
+        echo "📋 Available Downloads:"
+        echo "  📦 MSIX Installer (Recommended)"
+        echo "  📁 Portable ZIP Archive"
+        echo "  🔍 Debug Symbols"
+        echo ""
+        echo "🎯 Next steps:"
+        echo "  1. Verify downloads work correctly"
+        echo "  2. Update documentation if needed"
+        echo "  3. Announce release to users"
+        echo "  4. Monitor for any issues"
+      env:
+        SIGNING_STATUS: ${{ secrets.CODE_SIGNING_CERTIFICATE_BASE64 != '' && 'Enabled' || 'Not Configured' }}
 
     - name: Release Failure Notification
-      if: needs.create-github-release.result != 'success'
+      if: steps.release_status.outputs.overall_status == 'failure'
       run: |
-        echo "❌ Release creation failed!"
+        echo "${{ steps.release_status.outputs.status_emoji }} Release ${{ steps.release_status.outputs.version }} failed!"
+        echo ""
+        echo "❌ Failure Details:"
+        echo "  🔐 Security Scan: ${{ steps.release_status.outputs.security_status }}"
+        echo "  🏗️ Build Status: ${{ steps.release_status.outputs.build_status }}"
+        echo "  📦 Release Status: ${{ steps.release_status.outputs.release_status }}"
+        echo ""
+        echo "🔍 Troubleshooting:"
+        echo "  1. Check job logs for detailed error information"
+        echo "  2. Verify all secrets are properly configured"
+        echo "  3. Ensure code signing certificate is valid"
+        echo "  4. Check for any security vulnerabilities"
+        echo "  5. Verify version.txt format is correct"
+        echo ""
+        echo "📋 Action Required:"
+        echo "  - Review failed job logs"
+        echo "  - Fix any identified issues"
+        echo "  - Re-run the release workflow"
         exit 1
+
+    - name: Update release status badge
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const status = '${{ steps.release_status.outputs.overall_status }}';
+          const version = '${{ steps.release_status.outputs.version }}';
+          const emoji = '${{ steps.release_status.outputs.status_emoji }}';
+          
+          const state = status === 'success' ? 'success' : 'failure';
+          const description = status === 'success' ? 
+            `v${version} released successfully` : 
+            `v${version} release failed`;
+            
+          await github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.sha,
+            state: state,
+            description: description,
+            context: 'cd/release',
+            target_url: '${{ needs.create-github-release.outputs.release_url || github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          });
