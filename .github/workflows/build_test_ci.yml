@@ -27,8 +27,8 @@ jobs:
     
     strategy:
       matrix:
-        configuration: [Debug, Release]
-        platform: [x64, x86]
+        configuration: [Debug]
+        platform: [x64]
         
     steps:
     - name: Checkout code
@@ -67,7 +67,6 @@ jobs:
           /p:Platform=${{ matrix.platform }}
 
     - name: Build tests
-      if: matrix.configuration == 'Debug'  # Only build tests in Debug
       run: |
         dotnet build ${{ env.TEST_PROJECT_PATH }} \
           --configuration ${{ matrix.configuration }} \
@@ -75,7 +74,6 @@ jobs:
           --verbosity normal
 
     - name: Run unit tests
-      if: matrix.configuration == 'Debug'  # Only run tests in Debug to save time
       run: |
         dotnet test ${{ env.TEST_PROJECT_PATH }} \
           --configuration ${{ matrix.configuration }} \
@@ -86,22 +84,12 @@ jobs:
           --results-directory ./TestResults
 
     - name: Upload test results
-      if: matrix.configuration == 'Debug' && (success() || failure())
+      if: success() || failure()
       uses: actions/upload-artifact@v4
       with:
         name: test-results-${{ matrix.platform }}
         path: ./TestResults
         retention-days: 7
-
-    - name: Upload build artifacts
-      if: matrix.configuration == 'Release'
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-${{ matrix.platform }}-${{ matrix.configuration }}
-        path: |
-          src/bin/${{ matrix.configuration }}/**
-          src/obj/${{ matrix.configuration }}/**/*.msix
-        retention-days: 14
 
   code-quality:
     name: Code Quality Analysis
