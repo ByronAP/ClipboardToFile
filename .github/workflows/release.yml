@@ -24,7 +24,7 @@ on:
         type: boolean
 
 env:
-  DOTNET_VERSION: '8.0.x'
+  DOTNET_VERSION: '9.0.x'
   PROJECT_PATH: 'src/ClipboardToFile.csproj'
   SOLUTION_PATH: 'src/ClipboardToFile.sln'
 
@@ -201,10 +201,6 @@ jobs:
     runs-on: windows-latest
     needs: version-and-tag
     if: needs.version-and-tag.outputs.version != ''
-    
-    strategy:
-      matrix:
-        platform: [x64, x86]
         
     steps:
     - name: Checkout code
@@ -255,8 +251,8 @@ jobs:
       run: |
         msbuild ${{ env.PROJECT_PATH }} `
           /p:Configuration=Release `
-          /p:Platform=${{ matrix.platform }} `
-          /p:AppxBundlePlatforms=${{ matrix.platform }} `
+          /p:Platform=x64 `
+          /p:AppxBundlePlatforms=x64 `
           /p:AppxPackageDir=..\dist\msix\ `
           /p:AppxBundle=Always `
           /p:UapAppxPackageBuildMode=StoreUpload
@@ -265,16 +261,16 @@ jobs:
       run: |
         dotnet publish ${{ env.PROJECT_PATH }} `
           --configuration Release `
-          --runtime win-${{ matrix.platform }} `
+          --runtime win-x64 `
           --self-contained true `
-          --output ..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable `
+          --output ..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable `
           /p:PublishTrimmed=true `
           /p:PublishSingleFile=false
 
     - name: Create portable archive
       run: |
-        $portableDir = "..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable"
-        $archiveName = "ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-${{ matrix.platform }}-portable.zip"
+        $portableDir = "..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable"
+        $archiveName = "ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable.zip"
         
         # Add README to portable version
         @"
@@ -301,7 +297,7 @@ jobs:
     - name: Upload MSIX artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: msix-installer-${{ matrix.platform }}
+        name: msix-installer-x64
         path: |
           dist/msix/**/*.msix
           dist/msix/**/*.appxsym
@@ -310,7 +306,7 @@ jobs:
     - name: Upload portable artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: portable-${{ matrix.platform }}
+        name: portable-x64
         path: dist/*.zip
         retention-days: 30
 
