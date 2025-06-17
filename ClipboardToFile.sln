@@ -24,6 +24,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "assets", "assets", "{02EA68
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ClipboardToFile", "src\ClipboardToFile.csproj", "{EB7EF2E5-7D7A-4E03-8DB8-E4A44C0205A2}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests", "tests\Tests.csproj", "{95D6CAE3-C3AE-4915-B625-235D157E50D9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -52,6 +54,18 @@ Global
 		{EB7EF2E5-7D7A-4E03-8DB8-E4A44C0205A2}.Release|x86.ActiveCfg = Release|x86
 		{EB7EF2E5-7D7A-4E03-8DB8-E4A44C0205A2}.Release|x86.Build.0 = Release|x86
 		{EB7EF2E5-7D7A-4E03-8DB8-E4A44C0205A2}.Release|x86.Deploy.0 = Release|x86
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|ARM64.ActiveCfg = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|ARM64.Build.0 = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|x64.Build.0 = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Debug|x86.Build.0 = Debug|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|ARM64.ActiveCfg = Release|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|ARM64.Build.0 = Release|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|x64.ActiveCfg = Release|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|x64.Build.0 = Release|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|x86.ActiveCfg = Release|Any CPU
+		{95D6CAE3-C3AE-4915-B625-235D157E50D9}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
