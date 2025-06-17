@@ -21,7 +21,7 @@ on:
       - '*.sln'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
-     
+
 env:
   # .NET Configuration
   DOTNET_VERSION: '9.0.x'
@@ -186,16 +186,23 @@ jobs:
     # Additional static analysis tools
     - name: Run security analysis
       run: |
-        # Install security analyzer if not already present
-        dotnet list ${{ env.PROJECT_PATH }} package | grep -q Microsoft.CodeAnalysis.NetAnalyzers || \
+        # Check if security analyzer is already present
+        $packageList = dotnet list ${{ env.PROJECT_PATH }} package
+        if (-not ($packageList | Select-String -Pattern "Microsoft.CodeAnalysis.NetAnalyzers" -Quiet)) {
+          Write-Host "Installing Microsoft.CodeAnalysis.NetAnalyzers..."
           dotnet add ${{ env.PROJECT_PATH }} package Microsoft.CodeAnalysis.NetAnalyzers --version 8.0.0
+        }
         
         # Run analysis
-        dotnet build ${{ env.PROJECT_PATH }} \
-          --configuration Release \
-          --verbosity normal \
-          /p:RunCodeAnalysis=true \
-          /p:CodeAnalysisRuleSet=security.ruleset || true
+        dotnet build ${{ env.PROJECT_PATH }} `
+          --configuration Release `
+          --verbosity normal `
+          /p:RunCodeAnalysis=true `
+          /p:CodeAnalysisRuleSet=security.ruleset
+        
+        if ($LASTEXITCODE -ne 0) { 
+          Write-Host "Security analysis completed with warnings/errors"
+        }
 
   security-scan:
     name: Security Vulnerability Scan
@@ -238,35 +245,35 @@ jobs:
     - name: Scan for vulnerable packages
       id: vulnerability_scan
       run: |
-        echo "🔍 Scanning for vulnerable packages..."
+        Write-Host "🔍 Scanning for vulnerable packages..."
         
         # Scan main project
-        echo "Scanning main project..."
+        Write-Host "Scanning main project..."
         dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive > vulnerable-packages-main.log 2>&1
-        MAIN_VULNERABILITIES=$?
+        $MAIN_VULNERABILITIES = $LASTEXITCODE
         
         # Scan test project  
-        echo "Scanning test project..."
+        Write-Host "Scanning test project..."
         dotnet list ${{ env.TEST_PROJECT_PATH }} package --vulnerable --include-transitive > vulnerable-packages-tests.log 2>&1
-        TEST_VULNERABILITIES=$?
+        $TEST_VULNERABILITIES = $LASTEXITCODE
         
         # Check for critical/high vulnerabilities
-        CRITICAL_FOUND=0
-        if grep -i "critical\|high" vulnerable-packages-main.log vulnerable-packages-tests.log; then
-          echo "❌ Critical or High severity vulnerabilities found!"
-          CRITICAL_FOUND=1
-        fi
+        $CRITICAL_FOUND = 0
+        if ((Get-Content vulnerable-packages-main.log, vulnerable-packages-tests.log | Select-String -Pattern "critical|high" -Quiet)) {
+          Write-Host "❌ Critical or High severity vulnerabilities found!"
+          $CRITICAL_FOUND = 1
+        }
         
-        # Output results
-        echo "main_exit_code=$MAIN_VULNERABILITIES" >> $GITHUB_OUTPUT
-        echo "test_exit_code=$TEST_VULNERABILITIES" >> $GITHUB_OUTPUT
-        echo "critical_found=$CRITICAL_FOUND" >> $GITHUB_OUTPUT
+        # Output results for GitHub
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "main_exit_code=$MAIN_VULNERABILITIES"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "test_exit_code=$TEST_VULNERABILITIES" 
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "critical_found=$CRITICAL_FOUND"
         
         # Display scan results
-        echo "=== Main Project Vulnerabilities ==="
-        cat vulnerable-packages-main.log
-        echo "=== Test Project Vulnerabilities ==="
-        cat vulnerable-packages-tests.log
+        Write-Host "=== Main Project Vulnerabilities ==="
+        Get-Content vulnerable-packages-main.log
+        Write-Host "=== Test Project Vulnerabilities ==="
+        Get-Content vulnerable-packages-tests.log
 
     # Install and run additional security scanners
     - name: Install DevSkim CLI
@@ -275,11 +282,13 @@ jobs:
 
     - name: Run DevSkim security analysis
       run: |
-        echo "🛡️ Running DevSkim security analysis..."
-        devskim analyze src/ --output-format sarif --output-file devskim-results.sarif || true
+        Write-Host "🛡️ Running DevSkim security analysis..."
+        devskim analyze src/ --output-format sarif --output-file devskim-results.sarif
+        if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim analysis completed with warnings" }
         
         # Also run on tests for completeness
-        devskim analyze tests/ --output-format sarif --output-file devskim-tests-results.sarif || true
+        devskim analyze tests/ --output-format sarif --output-file devskim-tests-results.sarif
+        if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim test analysis completed with warnings" }
 
     # Upload SARIF results to GitHub Security tab
     - name: Upload DevSkim SARIF results
@@ -295,23 +304,23 @@ jobs:
     - name: Generate security summary
       if: always()
       run: |
-        echo "# 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "# 🛡️ Security Scan Summary"
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
         
-        if [ "${{ steps.vulnerability_scan.outputs.critical_found }}" = "1" ]; then
-          echo "## ❌ Critical Issues Found" >> $GITHUB_STEP_SUMMARY
-          echo "Critical or High severity vulnerabilities detected in dependencies." >> $GITHUB_STEP_SUMMARY
-        else
-          echo "## ✅ No Critical Issues" >> $GITHUB_STEP_SUMMARY
-          echo "No critical or high severity vulnerabilities found." >> $GITHUB_STEP_SUMMARY
-        fi
+        if ("${{ steps.vulnerability_scan.outputs.critical_found }}" -eq "1") {
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## ❌ Critical Issues Found"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Critical or High severity vulnerabilities detected in dependencies."
+        } else {
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## ✅ No Critical Issues"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "No critical or high severity vulnerabilities found."
+        }
         
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Package Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
-        echo "- Main project exit code: ${{ steps.vulnerability_scan.outputs.main_exit_code }}" >> $GITHUB_STEP_SUMMARY
-        echo "- Test project exit code: ${{ steps.vulnerability_scan.outputs.test_exit_code }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "📋 Detailed results available in job artifacts and GitHub Security tab." >> $GITHUB_STEP_SUMMARY
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Package Vulnerability Scan Results"
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Main project exit code: ${{ steps.vulnerability_scan.outputs.main_exit_code }}"
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Test project exit code: ${{ steps.vulnerability_scan.outputs.test_exit_code }}"
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "📋 Detailed results available in job artifacts and GitHub Security tab."
 
     - name: Upload security scan results
       if: always()
@@ -329,8 +338,8 @@ jobs:
     - name: Fail on critical vulnerabilities
       if: steps.vulnerability_scan.outputs.critical_found == '1'
       run: |
-        echo "💥 Build failed due to critical/high severity vulnerabilities!"
-        echo "Please review the security scan results and update vulnerable packages."
+        Write-Host "💥 Build failed due to critical/high severity vulnerabilities!"
+        Write-Host "Please review the security scan results and update vulnerable packages."
         exit 1
 
   epic-progress-check:
