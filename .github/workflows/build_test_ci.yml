@@ -86,32 +86,56 @@ jobs:
 
     - name: Build application
       run: |
-        dotnet build ${{ env.PROJECT_PATH }} \
-          --configuration ${{ env.BUILD_CONFIGURATION }} \
-          --no-restore \
-          --verbosity normal \
-          /p:Platform=${{ env.TARGET_PLATFORM }} \
-          /p:TreatWarningsAsErrors=false \
+        dotnet build ${{ env.PROJECT_PATH }} `
+          --configuration ${{ env.BUILD_CONFIGURATION }} `
+          --no-restore `
+          --verbosity normal `
+          /p:Platform=${{ env.TARGET_PLATFORM }} `
+          /p:TreatWarningsAsErrors=false `
           /p:ContinuousIntegrationBuild=true
 
     - name: Build tests
       run: |
-        dotnet build ${{ env.TEST_PROJECT_PATH }} \
-          --configuration ${{ env.BUILD_CONFIGURATION }} \
-          --no-restore \
+        dotnet build ${{ env.TEST_PROJECT_PATH }} `
+          --configuration ${{ env.BUILD_CONFIGURATION }} `
+          --no-restore `
           --verbosity normal
 
     - name: Run unit tests with coverage
       run: |
-        dotnet test ${{ env.TEST_PROJECT_PATH }} \
-          --configuration ${{ env.BUILD_CONFIGURATION }} \
-          --no-build \
-          --verbosity normal \
-          --logger trx \
-          --logger "console;verbosity=detailed" \
-          --collect:"XPlat Code Coverage" \
-          --results-directory ./TestResults \
-          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+        # Create simple runsettings for coverage if it doesn't exist
+        if (-not (Test-Path "coverlet.runsettings")) {
+          $runsettings = @'
+<?xml version="1.0" encoding="utf-8" ?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura,opencover</Format>
+          <Exclude>[*Tests*]*,[*Test*]*</Exclude>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
+'@
+          $runsettings | Out-File -FilePath "coverlet.runsettings" -Encoding UTF8
+        }
+        
+        dotnet test ${{ env.TEST_PROJECT_PATH }} `
+          --configuration ${{ env.BUILD_CONFIGURATION }} `
+          --no-build `
+          --verbosity normal `
+          --logger trx `
+          --logger "console;verbosity=detailed" `
+          --collect:"XPlat Code Coverage" `
+          --results-directory ./TestResults `
+          --settings coverlet.runsettings
+          
+        # List generated files for debugging
+        Write-Host "=== Generated Test Files ==="
+        Get-ChildItem -Path ./TestResults -Recurse | ForEach-Object { Write-Host $_.FullName }
 
     - name: Upload test results
       if: always()  # Upload even if tests fail
@@ -121,6 +145,34 @@ jobs:
         path: ./TestResults
         retention-days: 7
 
+    # Generate coverage report for manual review
+    - name: Generate coverage summary
+      if: always()
+      run: |
+        Write-Host "📊 Test Coverage Summary"
+        Write-Host "========================"
+        
+        # Look for coverage files
+        $coverageFiles = Get-ChildItem -Path ./TestResults -Filter "*.xml" -Recurse
+        if ($coverageFiles.Count -gt 0) {
+          Write-Host "✅ Found $($coverageFiles.Count) coverage file(s):"
+          $coverageFiles | ForEach-Object { Write-Host "  - $($_.Name)" }
+          
+          # Add to job summary
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## 📊 Test Coverage"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Coverage reports generated and available in artifacts."
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Coverage Files"
+          $coverageFiles | ForEach-Object { 
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- ``$($_.Name)``"
+          }
+        } else {
+          Write-Host "⚠️ No coverage files found"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## ⚠️ Test Coverage"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "No coverage files were generated. Check test configuration."
+        }
+
+    # Upload coverage to Codecov (with GitHub integration)
     - name: Upload coverage to Codecov
       if: always()
       uses: codecov/codecov-action@v4
@@ -129,6 +181,13 @@ jobs:
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false  # Don't fail CI if codecov upload fails
+        verbose: true  # Enable verbose logging for debugging
+        files: './TestResults/**/coverage.cobertura.xml,./TestResults/**/coverage.opencover.xml'
+        override_branch: ${{ github.head_ref || github.ref_name }}
+        override_commit: ${{ github.sha }}
+        override_pr: ${{ github.event.number }}
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN || '' }}
 
   code-quality:
     name: Code Quality Analysis
@@ -167,14 +226,14 @@ jobs:
     # Enhanced code analysis with stricter settings
     - name: Run code analysis
       run: |
-        dotnet build ${{ env.PROJECT_PATH }} \
-          --configuration Release \
-          --verbosity normal \
-          /p:TreatWarningsAsErrors=true \
-          /p:WarningsAsErrors="" \
-          /p:WarningsNotAsErrors="CS1591;CS1573" \
-          /p:RunAnalyzersDuringBuild=true \
-          /p:EnableNETAnalyzers=true \
+        dotnet build ${{ env.PROJECT_PATH }} `
+          --configuration Release `
+          --verbosity normal `
+          /p:TreatWarningsAsErrors=true `
+          /p:WarningsAsErrors="" `
+          /p:WarningsNotAsErrors="CS1591;CS1573" `
+          /p:RunAnalyzersDuringBuild=true `
+          /p:EnableNETAnalyzers=true `
           /p:AnalysisLevel=latest
 
     # Check code formatting (fail if not formatted)
