@@ -10,7 +10,6 @@ on:
       - '*.sln'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
-
   workflow_dispatch:
     inputs:
       release_type:
@@ -95,57 +94,58 @@ jobs:
     - name: Comprehensive vulnerability scan
       id: vulnerability_scan
       run: |
-        echo "🔍 Running comprehensive security scan for release..."
+        Write-Host "🔍 Running comprehensive security scan for release..."
         
         # Scan for vulnerable packages
         dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive > vulnerability-report.log 2>&1
-        VULNERABILITIES_FOUND=$?
+        $VULNERABILITIES_FOUND = $LASTEXITCODE
         
         # Check for critical/high severity issues
-        CRITICAL_COUNT=0
-        if grep -i "critical\|high" vulnerability-report.log; then
-          CRITICAL_COUNT=$(grep -i "critical\|high" vulnerability-report.log | wc -l)
-          echo "❌ Found $CRITICAL_COUNT critical/high severity vulnerabilities!"
-        fi
+        $CRITICAL_COUNT = 0
+        if ((Get-Content vulnerability-report.log | Select-String -Pattern "critical|high" -Quiet)) {
+          $CRITICAL_COUNT = (Get-Content vulnerability-report.log | Select-String -Pattern "critical|high").Count
+          Write-Host "❌ Found $CRITICAL_COUNT critical/high severity vulnerabilities!"
+        }
         
-        echo "vulnerabilities_exit_code=$VULNERABILITIES_FOUND" >> $GITHUB_OUTPUT
-        echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "vulnerabilities_exit_code=$VULNERABILITIES_FOUND"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "critical_count=$CRITICAL_COUNT"
         
         # Display results
-        echo "=== Security Scan Results ==="
-        cat vulnerability-report.log
+        Write-Host "=== Security Scan Results ==="
+        Get-Content vulnerability-report.log
 
     - name: Install security analysis tools
       run: |
-        echo "📦 Installing security analysis tools..."
+        Write-Host "📦 Installing security analysis tools..."
         dotnet tool install --global Microsoft.CST.DevSkim.CLI --verbosity minimal
 
     - name: Run static security analysis
       run: |
-        echo "🛡️ Running DevSkim static analysis..."
-        devskim analyze src/ --output-format json --output-file security-analysis.json || true
+        Write-Host "🛡️ Running DevSkim static analysis..."
+        devskim analyze src/ --output-format json --output-file security-analysis.json
+        if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim analysis completed with warnings" }
         
         # Check for any high/critical issues in static analysis
-        if [ -f security-analysis.json ]; then
-          echo "Static analysis completed, checking results..."
-          cat security-analysis.json
-        fi
+        if (Test-Path security-analysis.json) {
+          Write-Host "Static analysis completed, checking results..."
+          Get-Content security-analysis.json
+        }
 
     - name: Security assessment
       id: security_check
       run: |
-        CRITICAL_VULNS="${{ steps.vulnerability_scan.outputs.critical_count }}"
+        $CRITICAL_VULNS = "${{ steps.vulnerability_scan.outputs.critical_count }}"
         
-        if [ "$CRITICAL_VULNS" -gt 0 ]; then
-          echo "❌ SECURITY FAILURE: $CRITICAL_VULNS critical/high vulnerabilities found"
-          echo "🚫 Release blocked for security reasons"
-          echo "passed=false" >> $GITHUB_OUTPUT
+        if ([int]$CRITICAL_VULNS -gt 0) {
+          Write-Host "❌ SECURITY FAILURE: $CRITICAL_VULNS critical/high vulnerabilities found"
+          Write-Host "🚫 Release blocked for security reasons"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "passed=false"
           exit 1
-        else
-          echo "✅ SECURITY PASSED: No critical vulnerabilities found"
-          echo "🟢 Release approved for security"
-          echo "passed=true" >> $GITHUB_OUTPUT
-        fi
+        } else {
+          Write-Host "✅ SECURITY PASSED: No critical vulnerabilities found"
+          Write-Host "🟢 Release approved for security"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "passed=true"
+        }
 
     - name: Upload security reports
       if: always()
@@ -417,7 +417,7 @@ jobs:
         $portableDir = "${{ env.PORTABLE_OUTPUT_DIR }}ClipboardToFile-$version-$platform-portable"
         $archiveName = "ClipboardToFile-$version-$platform-portable.zip"
         
-        echo "📋 Creating enhanced portable package..."
+        Write-Host "📋 Creating enhanced portable package..."
         
         # Create comprehensive README for portable version
         $readmeContent = @"
@@ -428,7 +428,7 @@ This is the portable version of ClipboardToFile that requires no installation.
 ## 🚀 Quick Start
 1. Extract this ZIP file to any folder
 2. Run ClipboardToFile.exe
-3. The application will run from this folder
+3. The application will run from this folder with all settings stored locally
 
 ## 📋 What's Included
 - ClipboardToFile.exe (Main application)
@@ -442,7 +442,7 @@ This is the portable version of ClipboardToFile that requires no installation.
 - No additional runtime installation required
 
 ## 🔒 Security Information
-- All executables are digitally signed
+- All executables are digitally signed (if certificate available)
 - No registry modifications required
 - Runs entirely from the extraction folder
 - Settings stored in local application data
@@ -459,7 +459,7 @@ This is the portable version of ClipboardToFile that requires no installation.
 - **Latest Releases**: https://github.com/ByronAP/ClipboardToFile/releases
 
 ## 📜 License
-MIT: See LICENSE file or repository for full license information.
+See LICENSE file or repository for full license information.
 "@
         
         $readmeContent | Out-File -FilePath "$portableDir\README.txt" -Encoding UTF8
@@ -477,37 +477,37 @@ Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
         # Create the archive
         Compress-Archive -Path "$portableDir\*" -DestinationPath "${{ env.PORTABLE_OUTPUT_DIR }}$archiveName" -CompressionLevel Optimal
         
-        echo "✅ Portable archive created: $archiveName"
+        Write-Host "✅ Portable archive created: $archiveName"
 
     - name: Verify build artifacts
       run: |
-        echo "🔍 Verifying build artifacts..."
+        Write-Host "🔍 Verifying build artifacts..."
         
         # Check MSIX packages
         $msixFiles = Get-ChildItem -Path "${{ env.MSIX_PACKAGE_DIR }}" -Filter "*.msix" -Recurse
         if ($msixFiles.Count -eq 0) {
-          echo "❌ No MSIX files found!"
+          Write-Host "❌ No MSIX files found!"
           exit 1
         }
         
-        echo "📦 Found $($msixFiles.Count) MSIX package(s):"
+        Write-Host "📦 Found $($msixFiles.Count) MSIX package(s):"
         $msixFiles | ForEach-Object { 
-          echo "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+          Write-Host "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
         }
         
         # Check portable archives
         $zipFiles = Get-ChildItem -Path "${{ env.PORTABLE_OUTPUT_DIR }}" -Filter "*.zip"
         if ($zipFiles.Count -eq 0) {
-          echo "❌ No portable archives found!"
+          Write-Host "❌ No portable archives found!"
           exit 1
         }
         
-        echo "📁 Found $($zipFiles.Count) portable archive(s):"
+        Write-Host "📁 Found $($zipFiles.Count) portable archive(s):"
         $zipFiles | ForEach-Object { 
-          echo "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+          Write-Host "  - $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
         }
         
-        echo "✅ All artifacts verified successfully"
+        Write-Host "✅ All artifacts verified successfully"
 
     - name: Upload MSIX artifacts
       uses: actions/upload-artifact@v4
@@ -533,7 +533,7 @@ Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
       run: |
         if (Test-Path "$env:CERTIFICATE_PATH") {
           Remove-Item "$env:CERTIFICATE_PATH" -Force
-          echo "🧹 Certificate file cleaned up"
+          Write-Host "🧹 Certificate file cleaned up"
         }
 
   create-github-release:
