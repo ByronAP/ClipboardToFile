@@ -40,7 +40,7 @@ env:
   
   # Project Paths
   PROJECT_PATH: 'src/ClipboardToFile.csproj'
-  SOLUTION_PATH: 'src/ClipboardToFile.sln'
+  SOLUTION_PATH: 'ClipboardToFile.sln'
   
   # Build Configuration
   BUILD_CONFIGURATION: 'Release'
@@ -48,8 +48,8 @@ env:
   TARGET_RUNTIME: 'win-x64'
   
   # Release Configuration
-  MSIX_PACKAGE_DIR: '../dist/msix/'
-  PORTABLE_OUTPUT_DIR: '../dist/portable/'
+  MSIX_PACKAGE_DIR: 'dist/msix/'
+  PORTABLE_OUTPUT_DIR: 'dist/portable/'
   RELEASE_ARTIFACTS_DIR: 'release-artifacts'
 
 jobs:
@@ -131,6 +131,8 @@ jobs:
           Write-Host "✅ DevSkim SARIF report generated for release"
         } else {
           Write-Host "⚠️ No DevSkim SARIF report found"
+          # Create empty SARIF file to avoid upload issues
+          '{"version":"2.1.0","$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json","runs":[]}' | Out-File -FilePath "devskim-results.sarif" -Encoding UTF8
         }
 
     - name: Upload DevSkim SARIF results
@@ -165,7 +167,7 @@ jobs:
         path: |
           vulnerability-report.log
           devskim-results.sarif
-        retention-days: 90  # Keep security reports longer
+        retention-days: 90
         if-no-files-found: warn
 
   version-and-tag:
@@ -308,7 +310,11 @@ jobs:
           local temp_file=$(mktemp)
           
           for grep_pattern in "${greps[@]}"; do
-            git log $COMMIT_RANGE --pretty=format:"- %s" --grep="$grep_pattern" >> "$temp_file"
+            if [ -z "$COMMIT_RANGE" ]; then
+              git log --pretty=format:"- %s" --grep="$grep_pattern" >> "$temp_file" 2>/dev/null || true
+            else
+              git log $COMMIT_RANGE --pretty=format:"- %s" --grep="$grep_pattern" >> "$temp_file" 2>/dev/null || true
+            fi
           done
           
           if [ -s "$temp_file" ]; then
@@ -336,7 +342,11 @@ jobs:
         
         # Add Epic completion info
         echo "### 🏗️ Epic Progress" >> changelog.md
-        EPIC_COMMITS=$(git log $COMMIT_RANGE --pretty=format:"- %s" --grep="Epic #" --grep="epic #" | head -5)
+        if [ -z "$COMMIT_RANGE" ]; then
+          EPIC_COMMITS=$(git log --pretty=format:"- %s" --grep="Epic #" --grep="epic #" | head -5) || true
+        else
+          EPIC_COMMITS=$(git log $COMMIT_RANGE --pretty=format:"- %s" --grep="Epic #" --grep="epic #" | head -5) || true
+        fi
         if [ ! -z "$EPIC_COMMITS" ]; then
           echo "$EPIC_COMMITS" >> changelog.md
         else
@@ -345,9 +355,15 @@ jobs:
         echo "" >> changelog.md
         
         # Add technical details
-        COMMIT_COUNT=$(git rev-list $COMMIT_RANGE --count 2>/dev/null || echo "0")
-        CONTRIBUTOR_COUNT=$(git log $COMMIT_RANGE --pretty=format:"%an" 2>/dev/null | sort | uniq | wc -l || echo "0")
-        FILES_CHANGED=$(git diff --name-only $COMMIT_RANGE 2>/dev/null | wc -l || echo "0")
+        if [ -z "$COMMIT_RANGE" ]; then
+          COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+          CONTRIBUTOR_COUNT=$(git log --pretty=format:"%an" 2>/dev/null | sort | uniq | wc -l || echo "0")
+          FILES_CHANGED=$(git ls-files | wc -l || echo "0")
+        else
+          COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE 2>/dev/null || echo "0")
+          CONTRIBUTOR_COUNT=$(git log $COMMIT_RANGE --pretty=format:"%an" 2>/dev/null | sort | uniq | wc -l || echo "0")
+          FILES_CHANGED=$(git diff --name-only $COMMIT_RANGE 2>/dev/null | wc -l || echo "0")
+        fi
         
         echo "### 🔍 Technical Details" >> changelog.md
         echo "- **Commits in this release:** $COMMIT_COUNT" >> changelog.md
@@ -394,38 +410,113 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore ${{ env.PROJECT_PATH }}
 
+    # Import code signing certificate if available
+    - name: Import Code Signing Certificate
+      id: code_signing
+      if: env.CODE_SIGNING_CERTIFICATE_BASE64 != ''
+      env:
+        CODE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.CODE_SIGNING_CERTIFICATE_BASE64 }}
+        CODE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.CODE_SIGNING_CERTIFICATE_PASSWORD }}
+      run: |
+        Write-Host "🔏 Importing code signing certificate..."
+        
+        # Decode certificate from base64
+        $certBytes = [System.Convert]::FromBase64String("$env:CODE_SIGNING_CERTIFICATE_BASE64")
+        $certPath = Join-Path $env:TEMP "code_signing_cert.pfx"
+        [System.IO.File]::WriteAllBytes($certPath, $certBytes)
+        
+        # Import to certificate store
+        $securePassword = ConvertTo-SecureString "$env:CODE_SIGNING_CERTIFICATE_PASSWORD" -AsPlainText -Force
+        $cert = Import-PfxCertificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+        
+        # Save thumbprint for signing
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "thumbprint=$($cert.Thumbprint)"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "certificate_path=$certPath"
+        
+        Write-Host "✅ Certificate imported successfully"
+        Write-Host "📝 Thumbprint: $($cert.Thumbprint)"
+
     - name: Build MSIX Package (Installer)
       run: |
-        dotnet build ${{ env.PROJECT_PATH }} `
-          --configuration Release `
-          --no-restore `
-          /p:Platform=x64 `
-          /p:Version=${{ needs.version-and-tag.outputs.version }} `
-          /p:AssemblyVersion=${{ needs.version-and-tag.outputs.version }} `
-          /p:FileVersion=${{ needs.version-and-tag.outputs.version }} `
-          /p:AppxBundlePlatforms=x64 `
-          /p:AppxPackageDir=..\dist\msix\ `
-          /p:AppxBundle=Always `
-          /p:UapAppxPackageBuildMode=StoreUpload
+        Write-Host "📦 Building MSIX installer package..."
+        
+        # Create output directory
+        $msixDir = "${{ github.workspace }}\${{ env.MSIX_PACKAGE_DIR }}"
+        New-Item -ItemType Directory -Force -Path $msixDir | Out-Null
+        
+        # Use publish with the Windows App SDK profile
+        dotnet publish ${{ env.PROJECT_PATH }} `
+          --configuration ${{ env.BUILD_CONFIGURATION }} `
+          --runtime ${{ env.TARGET_RUNTIME }} `
+          --self-contained true `
+          --output "$msixDir\staging" `
+          -p:Platform=${{ env.TARGET_PLATFORM }} `
+          -p:PublishProfile=Properties\PublishProfiles\win-x64.pubxml `
+          -p:Version=${{ needs.version-and-tag.outputs.version }} `
+          -p:AssemblyVersion=${{ needs.version-and-tag.outputs.version }} `
+          -p:FileVersion=${{ needs.version-and-tag.outputs.version }} `
+          -p:AppxPackageDir="$msixDir" `
+          -p:AppxBundle=Never `
+          -p:UapAppxPackageBuildMode=SideloadOnly `
+          -p:GenerateAppxPackageOnBuild=true `
+          -p:PublishReadyToRun=true
+        
+        # Sign MSIX if certificate available
+        if ("${{ steps.code_signing.outputs.thumbprint }}" -ne "") {
+          Write-Host "🔏 Signing MSIX package..."
+          $msixFiles = Get-ChildItem -Path $msixDir -Filter "*.msix" -Recurse
+          foreach ($msix in $msixFiles) {
+            signtool sign /sha1 "${{ steps.code_signing.outputs.thumbprint }}" /tr http://timestamp.digicert.com /td sha256 /fd sha256 /v $msix.FullName
+          }
+        }
+        
+        Write-Host "✅ MSIX package built successfully"
 
     - name: Build Portable Version (Self-Contained)
       run: |
+        Write-Host "📁 Building portable version..."
+        
+        $version = "${{ needs.version-and-tag.outputs.version }}"
+        $platform = "${{ env.TARGET_PLATFORM }}"
+        $portableDir = "${{ github.workspace }}\${{ env.PORTABLE_OUTPUT_DIR }}"
+        $outputDir = "$portableDir\ClipboardToFile-$version-$platform-portable"
+        
+        # Create directory
+        New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+        
         dotnet publish ${{ env.PROJECT_PATH }} `
-          --configuration Release `
-          --runtime win-x64 `
+          --configuration ${{ env.BUILD_CONFIGURATION }} `
+          --runtime ${{ env.TARGET_RUNTIME }} `
           --self-contained true `
-          --output ..\dist\portable\ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-x64-portable `
-          /p:Version=${{ needs.version-and-tag.outputs.version }} `
-          /p:AssemblyVersion=${{ needs.version-and-tag.outputs.version }} `
-          /p:FileVersion=${{ needs.version-and-tag.outputs.version }} `
-          /p:PublishTrimmed=true `
-          /p:PublishSingleFile=false
+          --output "$outputDir" `
+          -p:Platform=${{ env.TARGET_PLATFORM }} `
+          -p:Version=$version `
+          -p:AssemblyVersion=$version `
+          -p:FileVersion=$version `
+          -p:PublishTrimmed=true `
+          -p:PublishSingleFile=false `
+          -p:PublishReadyToRun=true
+        
+        # Sign executables if certificate available
+        if ("${{ steps.code_signing.outputs.thumbprint }}" -ne "") {
+          Write-Host "🔏 Signing portable executables..."
+          $exeFiles = Get-ChildItem -Path $outputDir -Filter "*.exe" -Recurse
+          foreach ($exe in $exeFiles) {
+            signtool sign /sha1 "${{ steps.code_signing.outputs.thumbprint }}" /tr http://timestamp.digicert.com /td sha256 /fd sha256 /v $exe.FullName
+          }
+          $dllFiles = Get-ChildItem -Path $outputDir -Filter "ClipboardToFile.dll" -Recurse
+          foreach ($dll in $dllFiles) {
+            signtool sign /sha1 "${{ steps.code_signing.outputs.thumbprint }}" /tr http://timestamp.digicert.com /td sha256 /fd sha256 /v $dll.FullName
+          }
+        }
+        
+        Write-Host "✅ Portable version built successfully"
 
     - name: Create portable archive with enhanced metadata
       run: |
         $version = "${{ needs.version-and-tag.outputs.version }}"
         $platform = "${{ env.TARGET_PLATFORM }}"
-        $portableDir = "${{ env.PORTABLE_OUTPUT_DIR }}ClipboardToFile-$version-$platform-portable"
+        $portableDir = "${{ github.workspace }}\${{ env.PORTABLE_OUTPUT_DIR }}ClipboardToFile-$version-$platform-portable"
         $archiveName = "ClipboardToFile-$version-$platform-portable.zip"
         
         Write-Host "📋 Creating enhanced portable package..."
@@ -447,7 +538,8 @@ jobs:
         $readmeContent += "- x64 architecture (64-bit Windows)`n"
         $readmeContent += "- No additional runtime installation required`n`n"
         $readmeContent += "## 🔒 Security Information`n"
-        $readmeContent += "- All executables are digitally signed (if certificate available)`n"
+        $isSigned = if ("${{ steps.code_signing.outputs.thumbprint }}" -ne "") { "Yes" } else { "No" }
+        $readmeContent += "- Digitally signed: $isSigned`n"
         $readmeContent += "- No registry modifications required`n"
         $readmeContent += "- Runs entirely from the extraction folder`n"
         $readmeContent += "- Settings stored in local application data`n`n"
@@ -471,11 +563,13 @@ jobs:
         $versionInfo += "Platform: $platform`n"
         $versionInfo += "Runtime: ${{ env.TARGET_RUNTIME }}`n"
         $versionInfo += "Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}`n"
+        $versionInfo += "Code Signed: $isSigned`n"
         
         $versionInfo | Out-File -FilePath "$portableDir\VERSION.txt" -Encoding UTF8
         
         # Create the archive
-        Compress-Archive -Path "$portableDir\*" -DestinationPath "${{ env.PORTABLE_OUTPUT_DIR }}$archiveName" -CompressionLevel Optimal
+        $archivePath = "${{ github.workspace }}\${{ env.PORTABLE_OUTPUT_DIR }}$archiveName"
+        Compress-Archive -Path "$portableDir\*" -DestinationPath $archivePath -CompressionLevel Optimal
         
         Write-Host "✅ Portable archive created: $archiveName"
 
@@ -484,7 +578,8 @@ jobs:
         Write-Host "🔍 Verifying build artifacts..."
         
         # Check MSIX packages
-        $msixFiles = Get-ChildItem -Path "${{ env.MSIX_PACKAGE_DIR }}" -Filter "*.msix" -Recurse
+        $msixDir = "${{ github.workspace }}\${{ env.MSIX_PACKAGE_DIR }}"
+        $msixFiles = Get-ChildItem -Path $msixDir -Filter "*.msix" -Recurse -ErrorAction SilentlyContinue
         if ($msixFiles.Count -eq 0) {
           Write-Host "❌ No MSIX files found!"
           exit 1
@@ -496,7 +591,8 @@ jobs:
         }
         
         # Check portable archives
-        $zipFiles = Get-ChildItem -Path "${{ env.PORTABLE_OUTPUT_DIR }}" -Filter "*.zip"
+        $portableDir = "${{ github.workspace }}\${{ env.PORTABLE_OUTPUT_DIR }}"
+        $zipFiles = Get-ChildItem -Path $portableDir -Filter "*.zip" -ErrorAction SilentlyContinue
         if ($zipFiles.Count -eq 0) {
           Write-Host "❌ No portable archives found!"
           exit 1
@@ -531,9 +627,16 @@ jobs:
     - name: Cleanup
       if: always()
       run: |
-        if (Test-Path "$env:CERTIFICATE_PATH") {
-          Remove-Item "$env:CERTIFICATE_PATH" -Force
+        # Clean up certificate if it was imported
+        if ("${{ steps.code_signing.outputs.certificate_path }}" -ne "") {
+          Remove-Item "${{ steps.code_signing.outputs.certificate_path }}" -Force -ErrorAction SilentlyContinue
           Write-Host "🧹 Certificate file cleaned up"
+        }
+        
+        # Remove certificate from store
+        if ("${{ steps.code_signing.outputs.thumbprint }}" -ne "") {
+          Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq "${{ steps.code_signing.outputs.thumbprint }}" } | Remove-Item
+          Write-Host "🧹 Certificate removed from store"
         }
 
   create-github-release:
