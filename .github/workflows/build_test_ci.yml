@@ -344,11 +344,11 @@ jobs:
     - name: Run DevSkim security analysis
       run: |
         Write-Host "🛡️ Running DevSkim security analysis..."
-        devskim analyze src/ --output-format sarif --output-file devskim-results.sarif
+        devskim analyze -I src/ --output-format sarif --output-file devskim-results.sarif
         if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim analysis completed with warnings" }
         
         # Also run on tests for completeness
-        devskim analyze tests/ --output-format sarif --output-file devskim-tests-results.sarif
+        devskim analyze -I tests/ --output-format sarif --output-file devskim-tests-results.sarif
         if ($LASTEXITCODE -ne 0) { Write-Host "DevSkim test analysis completed with warnings" }
 
     # Upload SARIF results to GitHub Security tab
