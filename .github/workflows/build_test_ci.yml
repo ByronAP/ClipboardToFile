@@ -406,8 +406,9 @@ jobs:
   epic-progress-check:
     name: Epic Progress Tracking
     runs-on: ubuntu-latest
-    # Only run for epic feature branches
-    if: startsWith(github.ref, 'refs/heads/feature/epic')
+    # Only run for epic feature branches and after build completes
+    needs: [build-and-test]
+    if: always() && startsWith(github.ref, 'refs/heads/feature/epic')
 
     steps:
     - name: Extract Epic Number
@@ -440,8 +441,9 @@ jobs:
             );
             
             if (epicIssue) {
-              const buildStatus = '${{ needs.build-and-test.result }}' === 'success' ? '✅' : '❌';
-              const statusText = '${{ needs.build-and-test.result }}' === 'success' ? 'passing' : 'failing';
+              const buildResult = '${{ needs.build-and-test.result }}';
+              const buildStatus = buildResult === 'success' ? '✅' : '❌';
+              const statusText = buildResult === 'success' ? 'passing' : 'failing';
               
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
