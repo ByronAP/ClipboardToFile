@@ -233,7 +233,7 @@ jobs:
           --verbosity normal `
           /p:TreatWarningsAsErrors=true `
           /p:WarningsAsErrors="" `
-          /p:WarningsNotAsErrors="CS1591;CS1573" `
+          /p:WarningsNotAsErrors="CS1591,CS1573" `
           /p:RunAnalyzersDuringBuild=true `
           /p:EnableNETAnalyzers=true `
           /p:AnalysisLevel=latest
