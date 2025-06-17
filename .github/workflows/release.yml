@@ -605,13 +605,13 @@ Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
         ## 📥 Download Options
         
         ### 🏆 Recommended: MSIX Installer
-        - **File**: `ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*.msix`
+        - **File**: ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*.msix
         - **Best for**: Most users who want automatic updates and easy installation
         - **Requires**: Windows 10 version 1809+ with Developer Mode or sideloading enabled
         - **Security**: Digitally signed and verified by Windows
         
         ### 📱 Alternative: Portable Version  
-        - **File**: `ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*-portable.zip`
+        - **File**: ClipboardToFile-${{ needs.version-and-tag.outputs.version }}-*-portable.zip
         - **Best for**: Users who prefer no installation or want to run from USB drives
         - **Requires**: Just extract and run, no installation needed
         - **Security**: All executables digitally signed
@@ -629,11 +629,9 @@ Security Verified: ${{ needs.version-and-tag.outputs.security_passed }}
         EOF
         
         # Set output for release body
-        {
-          echo "enhanced_body<<EOF"
-          cat enhanced_changelog.md
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
+        echo "enhanced_body<<RELEASE_NOTES_EOF" >> $GITHUB_OUTPUT
+        cat enhanced_changelog.md >> $GITHUB_OUTPUT
+        echo "RELEASE_NOTES_EOF" >> $GITHUB_OUTPUT
       env:
         CODE_SIGNING_STATUS: ${{ secrets.CODE_SIGNING_CERTIFICATE_BASE64 != '' && 'Enabled' || 'Not Configured' }}
 
